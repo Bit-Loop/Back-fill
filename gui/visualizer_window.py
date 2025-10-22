@@ -23,7 +23,7 @@ import json
 import math
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional, Dict, List, Any, TYPE_CHECKING
+from typing import Optional, Dict, List, Any
 import subprocess
 import signal
 
@@ -87,152 +87,19 @@ try:
 except ImportError:
     REDIS_AVAILABLE = False
     logging.warning("Redis not available - install with: pip install redis")
+    redis = None  # type: ignore[assignment]
 
 try:
-    from PyQt6.QtWebEngineWidgets import QWebEngineView
-    from PyQt6.QtWebChannel import QWebChannel  # noqa: F401 (reserved for future use)
-    WEBENGINE_AVAILABLE = True
+    from lightweight_charts import Chart
+    LIGHTWEIGHT_CHARTS_AVAILABLE = True
 except ImportError:
-    WEBENGINE_AVAILABLE = False
-    logging.warning("PyQt6-WebEngine not available - install with: pip install PyQt6-WebEngine")
-
-if TYPE_CHECKING:
-    from PyQt6.QtWebEngineWidgets import QWebEngineView as _QWebEngineView
-else:
-    _QWebEngineView = Any
+    LIGHTWEIGHT_CHARTS_AVAILABLE = False
+    logging.warning(
+        "lightweight-charts not available - install with: pip install lightweight-charts"
+    )
+    Chart = Any  # type: ignore[misc, assignment]
 
 
-class LightweightChartWidget(QWidget):
-    """Embedded lightweight-charts view backed by QWebEngine."""
-
-    def __init__(self, parent: Optional[QWidget] = None):
-        super().__init__(parent)
-        self._view: Optional[_QWebEngineView] = None
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-
-        if not WEBENGINE_AVAILABLE:
-            placeholder = QLabel("PyQt6-WebEngine not installed.\nInstall with: pip install PyQt6-WebEngine")
-            placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            placeholder.setStyleSheet(
-                "background-color: #1e1e1e; color: #ff5555; font-size: 14px; padding: 40px;"
-            )
-            layout.addWidget(placeholder)
-            return
-
-        self._view = QWebEngineView()
-        if self._view is not None:
-            self._view.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
-            layout.addWidget(self._view)
-            self._view.setHtml(self._html_template())
-
-    @staticmethod
-    def _html_template() -> str:
-        return """<!DOCTYPE html>
-<html lang='en'>
-    <head>
-        <meta charset='utf-8'>
-        <style>
-            html, body { margin: 0; height: 100%; background: #0b0e11; }
-            #chart { width: 100%; height: 100%; }
-            * { font-family: 'Roboto', sans-serif; }
-        </style>
-        <script src='https://unpkg.com/lightweight-charts@4.1.0/dist/lightweight-charts.standalone.production.js'></script>
-    </head>
-    <body>
-        <div id='chart'></div>
-        <script>
-            const chart = LightweightCharts.createChart(document.getElementById('chart'), {
-                layout: {
-                    background: { type: 'solid', color: '#0b0e11' },
-                    textColor: '#d1d4dc'
-                },
-                crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
-                rightPriceScale: {
-                    borderVisible: false,
-                    scaleMargins: { top: 0.1, bottom: 0.15 }
-                },
-                timeScale: {
-                    borderVisible: false,
-                    timeVisible: true,
-                    secondsVisible: false
-                },
-                grid: {
-                    vertLines: { color: 'rgba(42, 46, 57, 0.5)' },
-                    horzLines: { color: 'rgba(42, 46, 57, 0.5)' }
-                }
-            });
-
-            const candleSeries = chart.addCandlestickSeries({
-                upColor: 'rgba(83, 141, 131, 0.9)',
-                downColor: 'rgba(200, 97, 100, 0.9)',
-                borderVisible: false,
-                wickUpColor: 'rgba(83, 141, 131, 1)',
-                wickDownColor: 'rgba(200, 97, 100, 1)'
-            });
-
-            const volumeSeries = chart.addHistogramSeries({
-                priceScaleId: '',
-                priceFormat: { type: 'volume' },
-                scaleMargins: { top: 0.8, bottom: 0 }
-            });
-
-            window.qtChart = {
-                setCandles: function(data) {
-                    candleSeries.setData(data);
-                    if (data && data.length) {
-                        volumeSeries.setData(data.map(bar => ({
-                            time: bar.time,
-                            value: bar.volume || 0,
-                            color: bar.close >= bar.open ? 'rgba(83,141,131,0.7)' : 'rgba(200,97,100,0.7)'
-                        })));
-                        chart.timeScale().fitContent();
-                    }
-                },
-                updateCandle: function(bar) {
-                    candleSeries.update(bar);
-                    if (bar.volume !== undefined) {
-                        volumeSeries.update({
-                            time: bar.time,
-                            value: bar.volume,
-                            color: bar.close >= bar.open ? 'rgba(83,141,131,0.7)' : 'rgba(200,97,100,0.7)'
-                        });
-                    }
-                },
-                setWatermark: function(text) {
-                    chart.applyOptions({
-                        watermark: {
-                            visible: !!text,
-                            text: text || '',
-                            color: 'rgba(180, 180, 200, 0.35)',
-                            fontSize: 26,
-                            fontFamily: 'Roboto'
-                        }
-                    });
-                }
-            };
-        </script>
-    </body>
-</html>
-"""
-
-        @property
-        def is_ready(self) -> bool:
-            return self._view is not None
-
-        def set_candles(self, candles: List[Dict[str, Any]], watermark: str = "") -> None:
-                if not self._view:
-                        return
-                payload = json.dumps(candles)
-                self._view.page().runJavaScript(f"window.qtChart.setCandles({payload});")
-                if watermark:
-                        self._view.page().runJavaScript(f"window.qtChart.setWatermark({json.dumps(watermark)});")
-
-        def update_candle(self, candle: Dict[str, Any]) -> None:
-                if not self._view:
-                        return
-                self._view.page().runJavaScript(f"window.qtChart.updateCandle({json.dumps(candle)});")
 
 
 
@@ -2265,898 +2132,645 @@ if POLYGON_DEPS_AVAILABLE:
                 )
 
 
-    class MarketDataWidget(QWidget):
-        """Market Data tab with candlestick charts, indicators, news, and reference data"""
-        
-        def __init__(self, parent=None):
-            super().__init__(parent)
-            self.worker: Optional[PolygonDataWorker] = None
-            self.ticker = "AMD"
-            self.api_key = ""
-            
-            # Data storage
-            self.candles: deque = deque(maxlen=1000)
-            self.indicators = {}
-            self.dividends = []
-            self.splits = []
-            self.news_articles = []
-            self.reference_data = {}
-            
-            # Chart update throttle
-            self._last_chart_update = datetime.now()
-            
-            # Indicator visibility toggles
-            self.show_sma = True
-            self.show_ema = True
-            self.show_bb = True
-            self.show_vwap = True
-            self.show_rsi = False  # Hidden by default (panel)
-            self.show_macd = False  # Hidden by default (panel)
-            
-            # Redis subscriber for event-driven updates
-            self.redis_subscriber: Optional[RedisSubscriberThread] = None
-            
-            self._init_ui()
-        
-        def _init_ui(self):
-            """Initialize Market Data UI"""
-            layout = QVBoxLayout(self)
-            
-            # ============================================================
-            # CONTROL PANEL
-            # ============================================================
-            control_group = QGroupBox("Market Data Controls")
-            control_layout = QHBoxLayout()
-            
-            control_layout.addWidget(QLabel("Ticker:"))
-            self.ticker_input = QLineEdit()
-            self.ticker_input.setText("AMD")
-            self.ticker_input.setMaximumWidth(100)
-            control_layout.addWidget(self.ticker_input)
-            
-            # Redis real-time mode (preferred)
-            self.redis_btn = QPushButton("⚡ Redis Live (Event-Driven)")
-            self.redis_btn.clicked.connect(self._start_redis_subscriber)
-            self.redis_btn.setStyleSheet("background-color: #4CAF50; font-weight: bold;")
-            control_layout.addWidget(self.redis_btn)
-            
-            # Legacy Polygon WebSocket mode
-            self.connect_btn = QPushButton("📡 Polygon WebSocket (Legacy)")
-            self.connect_btn.clicked.connect(self._start_worker)
-            control_layout.addWidget(self.connect_btn)
-            
-            self.disconnect_btn = QPushButton("⏹ Disconnect")
-            self.disconnect_btn.clicked.connect(self._stop_all)
-            self.disconnect_btn.setEnabled(False)
-            control_layout.addWidget(self.disconnect_btn)
-            
-            self.status_label = QLabel("⚫ Not Connected")
-            control_layout.addWidget(self.status_label)
-            
-            control_layout.addStretch()
-            control_group.setLayout(control_layout)
-            layout.addWidget(control_group)
-            
-            # ============================================================
-            # MAIN CONTENT: Embedded Lightweight Charts View
-            # ============================================================
-            content_splitter = QSplitter(Qt.Orientation.Horizontal)
+class MarketDataWidget(QWidget):
+    """Market data view backed by lightweight-charts."""
 
-            # Left: Interactive Candlestick Chart
-            chart_widget = QWidget()
-            chart_layout = QVBoxLayout(chart_widget)
-            chart_layout.setContentsMargins(0, 0, 0, 0)
+    CHART_TIMEFRAMES = ("1m", "5m", "15m", "1h", "1d")
+    INDICATOR_GROUPS = {
+        "sma": [
+            ("sma_20", "SMA 20", "#FFA726"),
+            ("sma_50", "SMA 50", "#AB47BC"),
+        ],
+        "ema": [
+            ("ema_20", "EMA 20", "#42A5F5"),
+            ("ema_50", "EMA 50", "#66BB6A"),
+        ],
+        "bb": [
+            ("bb_upper", "BB Upper", "#78909C"),
+            ("bb_middle", "BB Middle", "#90A4AE"),
+            ("bb_lower", "BB Lower", "#78909C"),
+        ],
+        "vwap": [
+            ("vwap", "VWAP", "#FDD835"),
+        ],
+    }
 
-            self.chart_widget = LightweightChartWidget()
-            chart_layout.addWidget(self.chart_widget)
-            
-            content_splitter.addWidget(chart_widget)
-            
-            # Right: Sidebar (News + Reference + Corporate)
-            sidebar = QWidget()
-            sidebar_layout = QVBoxLayout(sidebar)
-            
-            # News Feed
-            news_group = QGroupBox("📰 Latest News")
-            news_layout = QVBoxLayout()
-            self.news_text = QTextEdit()
-            self.news_text.setReadOnly(True)
-            self.news_text.setMaximumHeight(200)
-            self.news_text.setStyleSheet("background-color: #1e1e1e; color: #d4d4d4;")
-            news_layout.addWidget(self.news_text)
-            news_group.setLayout(news_layout)
-            sidebar_layout.addWidget(news_group)
-            
-            # Reference Data
-            ref_group = QGroupBox("📋 Reference Data")
-            ref_layout = QVBoxLayout()
-            self.ref_table = QTableWidget()
-            self.ref_table.setColumnCount(2)
-            self.ref_table.setHorizontalHeaderLabels(["Field", "Value"])
-            self.ref_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-            self.ref_table.setMaximumHeight(150)
-            ref_layout.addWidget(self.ref_table)
-            ref_group.setLayout(ref_layout)
-            sidebar_layout.addWidget(ref_group)
-            
-            # Corporate Actions
-            corp_group = QGroupBox("💼 Corporate Actions")
-            corp_layout = QVBoxLayout()
-            self.corp_table = QTableWidget()
-            self.corp_table.setColumnCount(4)
-            self.corp_table.setHorizontalHeaderLabels(["Date", "Type", "Amount", "Details"])
-            self.corp_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-            self.corp_table.setMaximumHeight(150)
-            corp_layout.addWidget(self.corp_table)
-            corp_group.setLayout(corp_layout)
-            sidebar_layout.addWidget(corp_group)
-            
-            sidebar_layout.addStretch()
-            content_splitter.addWidget(sidebar)
-            
-            # Set splitter sizes (70% chart, 30% sidebar)
-            content_splitter.setSizes([700, 300])
-            
-            layout.addWidget(content_splitter)
-        
-        def _start_worker(self):
-            """Start Polygon data worker"""
-            # Load API key from .env
-            load_dotenv()
-            self.api_key = os.getenv('POLYGON_API_KEY', '')
-            
-            if not self.api_key:
-                self.status_label.setText("❌ No API key in .env")
-                return
-            
-            self.ticker = self.ticker_input.text().strip().upper()
-            if not self.ticker:
-                self.status_label.setText("❌ Enter ticker")
-                return
-            
-            # Clear previous data
-            self.candles.clear()
-            self.indicators.clear()
-            self.dividends.clear()
-            self.splits.clear()
-            self.news_articles.clear()
-            self.reference_data.clear()
-            
-            # Start worker
-            self.worker = PolygonDataWorker(self.ticker, self.api_key)
-            self.worker.candle_signal.connect(self._on_candle)
-            self.worker.indicator_signal.connect(self._on_indicators)
-            self.worker.news_signal.connect(self._on_news)
-            self.worker.reference_signal.connect(self._on_reference)
-            self.worker.corporate_signal.connect(self._on_corporate)
-            self.worker.status_signal.connect(self._on_status)
-            self.worker.error_signal.connect(self._on_error)
-            self.worker.start()
-            
-            # Update UI
-            self.connect_btn.setEnabled(False)
-            self.disconnect_btn.setEnabled(True)
-            self.status_label.setText("🔄 Connecting...")
-        
-        def _stop_worker(self):
-            """Stop Polygon data worker"""
-            if self.worker:
-                self.worker.stop()
-                self.worker.wait()
-                self.worker = None
-            
-            self.connect_btn.setEnabled(True)
-            self.disconnect_btn.setEnabled(False)
-            self.status_label.setText("⚫ Disconnected")
-        
-        def _stop_all(self):
-            """Stop all data sources (Redis + Polygon)"""
-            self._stop_worker()
-            self._stop_redis_subscriber()
-            
-            self.redis_btn.setEnabled(True)
-            self.connect_btn.setEnabled(True)
-            self.disconnect_btn.setEnabled(False)
-        
-        def _start_redis_subscriber(self):
-            """Start Redis subscriber for event-driven chart updates"""
-            if not REDIS_AVAILABLE:
-                logging.warning("Redis library not available - falling back to database-only mode")
-                self.status_label.setText("❌ Redis not available - install: pip install redis")
-                # Fall back to just loading from database
-                self._reload_chart_data()
-                return
-            
-            # Get ticker from input
-            self.ticker = self.ticker_input.text().strip().upper()
-            if not self.ticker:
-                self.status_label.setText("❌ Enter ticker")
-                return
-            
-            # Get Redis password from environment
-            redis_password = os.getenv('REDIS_PASSWORD', None)
-            redis_port = int(os.getenv('REDIS_PORT', '6380'))  # Default to dev server on 6380
-            
-            # Test if Redis is actually running before starting subscriber
-            try:
-                test_client = redis.Redis(
-                    host='localhost', 
-                    port=redis_port, 
-                    password=redis_password,
-                    socket_connect_timeout=2
-                )
-                test_client.ping()
-                test_client.close()
-                logging.info(f"✓ Redis server is running on port {redis_port}")
-            except redis.AuthenticationError as e:
-                error_msg = "Redis requires authentication"
-                logging.warning(f"{error_msg}: {e}")
-                self.status_label.setText(f"⚠️ Redis auth failed - using database-only mode")
-                
-                # Show user-friendly message
-                logging.info("💡 To enable real-time updates with authenticated Redis:")
-                logging.info("   1. Set password in .env: REDIS_PASSWORD=your_password")
-                logging.info("   2. Or disable Redis auth: redis-cli CONFIG SET requirepass \"\"")
-                logging.info("   3. Or use database-only mode (current fallback)")
-                
-                # Fall back to database-only mode
-                self._reload_chart_data()
-                return
-            except (redis.ConnectionError, redis.TimeoutError, Exception) as e:
-                error_msg = f"Redis server not available: {e}"
-                logging.warning(error_msg)
-                self.status_label.setText(f"⚠️ Redis offline - using database-only mode")
-                
-                # Show user-friendly message
-                logging.info("💡 To enable real-time updates:")
-                logging.info("   1. Install Redis: sudo apt install redis-server")
-                logging.info("   2. Start Redis: sudo systemctl start redis-server")
-                logging.info("   3. Or run: redis-server")
-                
-                # Fall back to database-only mode
-                self._reload_chart_data()
-                return
-            
-            # Stop existing subscriber
-            if self.redis_subscriber and self.redis_subscriber.isRunning():
-                self.redis_subscriber.stop()
-            
-            # Create new subscriber
-            symbols = [self.ticker]
-            timeframes = [self.current_timeframe]
-            
-            self.redis_subscriber = RedisSubscriberThread(
-                symbols=symbols,
-                timeframes=timeframes,
-                redis_host='localhost',
-                redis_port=redis_port,
-                redis_password=redis_password
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+
+        if not POLYGON_DEPS_AVAILABLE:
+            raise RuntimeError(
+                "Polygon market data dependencies are not installed. "
+                "Run install_market_data_deps script first."
             )
-            
-            # Connect signals
-            self.redis_subscriber.bar_received.connect(self._on_redis_bar)
-            self.redis_subscriber.error_occurred.connect(self._on_redis_error)
-            self.redis_subscriber.connected.connect(self._on_redis_connected)
-            self.redis_subscriber.disconnected.connect(self._on_redis_disconnected)
-            
-            # Start subscriber
-            self.redis_subscriber.start()
-            self.status_label.setText("🔄 Connecting to Redis...")
-            
-            # Update UI
-            self.redis_btn.setEnabled(False)
-            self.connect_btn.setEnabled(False)
-            self.disconnect_btn.setEnabled(True)
-        
-        def _stop_redis_subscriber(self):
-            """Stop Redis subscriber"""
-            if self.redis_subscriber and self.redis_subscriber.isRunning():
-                self.redis_subscriber.stop()
-                self.redis_subscriber = None
-                self.status_label.setText("⚫ Redis disconnected")
-        
-        def _on_redis_bar(self, bar_data: dict):
-            """Handle incoming bar from Redis (event-driven, real-time update)"""
-            try:
-                # Extract bar fields
-                symbol = bar_data.get('symbol', self.ticker)
-                if symbol != self.ticker:
-                    return  # Ignore bars for different symbols
-                
-                # Convert to DataFrame row (already enriched with indicators)
-                import pandas as pd
-                new_row = pd.DataFrame([bar_data])
-                
-                # Ensure timestamp is datetime
-                if 'time' in new_row.columns:
-                    new_row['time'] = pd.to_datetime(new_row['time'])
-                
-                # Append to existing chart data (O(1) operation)
-                if not hasattr(self, 'chart_data') or self.chart_data is None or self.chart_data.empty:
-                    self.chart_data = new_row
-                    # Initial load - set full chart
-                    if self.chart:
-                        self._update_lightweight_chart()
-                else:
-                    # Check for duplicate timestamps (update vs append)
-                    if 'time' in self.chart_data.columns and 'time' in new_row.columns:
-                        last_time = self.chart_data['time'].iloc[-1]
-                        new_time = new_row['time'].iloc[0]
-                        if new_time <= last_time:
-                            # Update existing bar (idempotent)
-                            self.chart_data.iloc[-1] = new_row.iloc[0]
-                        else:
-                            # Append new bar
-                            self.chart_data = pd.concat([self.chart_data, new_row], ignore_index=True)
-                    else:
-                        self.chart_data = pd.concat([self.chart_data, new_row], ignore_index=True)
-                    
-                    # Real-time update - use lightweight-charts update method
-                    if self.chart and not new_row.empty:
-                        # Prepare row for update
-                        update_row = new_row.iloc[0].to_dict()
-                        
-                        # Apply percentage mode if enabled
-                        if self.display_mode == 'percentage' and self.reference_price:
-                            for col in ['open', 'high', 'low', 'close']:
-                                if col in update_row:
-                                    update_row[col] = ((update_row[col] / self.reference_price) - 1) * 100
-                        
-                        # Update main chart (single bar update - very fast!)
-                        self.chart.update(update_row)
-                        
-                        # Update indicator lines if they exist
-                        for indicator_name, line in self.indicator_lines.items():
-                            if indicator_name in update_row and pd.notna(update_row[indicator_name]):
-                                indicator_update = {
-                                    'time': update_row['time'],
-                                    line.name: update_row[indicator_name]
-                                }
-                                line.update(indicator_update)
-                
-                logging.debug(f"Updated chart with bar: {symbol} @ {bar_data.get('time')}")
-                
-            except Exception as e:
-                logging.error(f"Redis bar update error: {e}", exc_info=True)
-        
-        def _on_redis_error(self, error_msg: str):
-            """Handle Redis connection/parsing errors"""
-            logging.error(f"Redis error: {error_msg}")
-            self.status_label.setText(f"❌ Redis error: {error_msg}")
-        
-        def _on_redis_connected(self):
-            """Handle successful Redis connection"""
-            logging.info("✓ Redis subscriber connected")
-            self.status_label.setText("✅ Redis connected - Live updates")
-            
-            # Initial chart load from database
+
+        self.ticker = "AMD"
+        self.api_key = ""
+        self.current_timeframe = "1m"
+        self.display_mode = "price"
+        self.reference_price: Optional[float] = None
+
+        self.chart: Optional[Chart] = None
+        self.chart_shown = False
+        self.chart_data = None
+        self.indicator_lines: Dict[str, Any] = {}
+        self.indicator_state = {
+            "sma": True,
+            "ema": True,
+            "bb": True,
+            "vwap": True,
+        }
+        self.indicator_arrays: Dict[str, Any] = {}
+        self.chart_patterns: Dict[str, Any] = {}
+
+        self.redis_subscriber: Optional[RedisSubscriberThread] = None
+        self.worker: Optional[PolygonDataWorker] = None
+        self.data_loader: Optional[ChartDataInitialLoader] = None
+        self.cancel_load = False
+
+        self.candles: deque = deque(maxlen=1000)
+        self.news_articles: List[dict] = []
+        self.reference_data: Dict[str, Any] = {}
+        self.dividends: List[dict] = []
+        self.splits: List[dict] = []
+        self._last_chart_update = datetime.now()
+
+        self._init_ui()
+
+    # ------------------------------------------------------------------
+    # UI SETUP
+    # ------------------------------------------------------------------
+    def _init_ui(self) -> None:
+        layout = QVBoxLayout(self)
+
+        control_group = QGroupBox("Market Data Controls")
+        control_layout = QHBoxLayout()
+
+        control_layout.addWidget(QLabel("Ticker:"))
+        self.ticker_input = QLineEdit(self.ticker)
+        self.ticker_input.setMaximumWidth(120)
+        control_layout.addWidget(self.ticker_input)
+
+        self.redis_btn = QPushButton("⚡ Redis Live")
+        self.redis_btn.setStyleSheet("background-color: #4CAF50; font-weight: bold;")
+        self.redis_btn.clicked.connect(self._start_redis_subscriber)
+        control_layout.addWidget(self.redis_btn)
+
+        self.websocket_btn = QPushButton("📡 Polygon WebSocket")
+        self.websocket_btn.clicked.connect(self._start_worker)
+        control_layout.addWidget(self.websocket_btn)
+
+        self.disconnect_btn = QPushButton("⏹ Disconnect")
+        self.disconnect_btn.setEnabled(False)
+        self.disconnect_btn.clicked.connect(self._stop_all)
+        control_layout.addWidget(self.disconnect_btn)
+
+        self.resume_live_btn = QPushButton("▶ Resume Live")
+        self.resume_live_btn.setEnabled(False)
+        self.resume_live_btn.clicked.connect(self._start_redis_live)
+        control_layout.addWidget(self.resume_live_btn)
+
+        self.open_chart_btn = QPushButton("🪟 Open Chart Window")
+        self.open_chart_btn.clicked.connect(self._show_chart_window)
+        control_layout.addWidget(self.open_chart_btn)
+
+        self.status_label = QLabel("⚫ Not Connected")
+        control_layout.addWidget(self.status_label)
+        control_layout.addStretch()
+
+        control_group.setLayout(control_layout)
+        layout.addWidget(control_group)
+
+        indicator_group = QGroupBox("Indicators")
+        indicator_layout = QHBoxLayout()
+        self.indicator_checks: Dict[str, QCheckBox] = {}
+        for key, label in (
+            ("sma", "SMA"),
+            ("ema", "EMA"),
+            ("bb", "Bollinger"),
+            ("vwap", "VWAP"),
+        ):
+            cb = QCheckBox(label)
+            cb.setChecked(self.indicator_state[key])
+            cb.stateChanged.connect(lambda state, k=key: self._on_indicator_toggle(k, state))
+            indicator_layout.addWidget(cb)
+            self.indicator_checks[key] = cb
+        indicator_layout.addStretch()
+        indicator_group.setLayout(indicator_layout)
+        layout.addWidget(indicator_group)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        chart_panel = QWidget()
+        chart_layout = QVBoxLayout(chart_panel)
+        chart_layout.setContentsMargins(0, 0, 0, 0)
+        self.chart_status = QLabel(
+            "Chart opens in a dedicated window powered by lightweight-charts."
+        )
+        self.chart_status.setWordWrap(True)
+        self.chart_status.setStyleSheet("color: #bbb;")
+        chart_layout.addWidget(self.chart_status)
+
+        self.last_update_label = QLabel("Last update: –")
+        self.last_update_label.setStyleSheet("color: #888;")
+        chart_layout.addWidget(self.last_update_label)
+        chart_layout.addStretch()
+
+        splitter.addWidget(chart_panel)
+
+        sidebar = QWidget()
+        sidebar_layout = QVBoxLayout(sidebar)
+
+        news_group = QGroupBox("📰 Latest News")
+        news_layout = QVBoxLayout()
+        self.news_text = QTextEdit()
+        self.news_text.setReadOnly(True)
+        self.news_text.setStyleSheet("background-color: #1e1e1e; color: #d4d4d4;")
+        self.news_text.setMaximumHeight(200)
+        news_layout.addWidget(self.news_text)
+        news_group.setLayout(news_layout)
+        sidebar_layout.addWidget(news_group)
+
+        ref_group = QGroupBox("📋 Reference Data")
+        ref_layout = QVBoxLayout()
+        self.ref_table = QTableWidget()
+        self.ref_table.setColumnCount(2)
+        self.ref_table.setHorizontalHeaderLabels(["Field", "Value"])
+        self.ref_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.ref_table.setMaximumHeight(160)
+        ref_layout.addWidget(self.ref_table)
+        ref_group.setLayout(ref_layout)
+        sidebar_layout.addWidget(ref_group)
+
+        corp_group = QGroupBox("💼 Corporate Actions")
+        corp_layout = QVBoxLayout()
+        self.corp_table = QTableWidget()
+        self.corp_table.setColumnCount(4)
+        self.corp_table.setHorizontalHeaderLabels(["Date", "Type", "Amount", "Details"])
+        self.corp_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.corp_table.setMaximumHeight(160)
+        corp_layout.addWidget(self.corp_table)
+        corp_group.setLayout(corp_layout)
+        sidebar_layout.addWidget(corp_group)
+
+        sidebar_layout.addStretch()
+        splitter.addWidget(sidebar)
+        splitter.setSizes([720, 320])
+
+        layout.addWidget(splitter)
+
+    # ------------------------------------------------------------------
+    # CHART MANAGEMENT
+    # ------------------------------------------------------------------
+    def _ensure_chart(self) -> Optional[Chart]:
+        if not LIGHTWEIGHT_CHARTS_AVAILABLE:
+            self.chart_status.setText(
+                "Install lightweight-charts to enable the interactive chart "
+                "(pip install lightweight-charts)."
+            )
+            return None
+
+        if self.chart is None:
+            self.chart = Chart(title="ChronoX Market Data", toolbox=True)
+            self.chart.legend(True)
+            self.chart.events.search += self._on_chart_search
+            self.chart.topbar.textbox('symbol', self.ticker)
+            self.chart.topbar.switcher(
+                'timeframe',
+                self.CHART_TIMEFRAMES,
+                default=self.current_timeframe,
+                func=self._on_chart_timeframe_change,
+            )
+            self.chart.topbar.button('resume', 'Resume Live', func=self._on_chart_resume)
+        return self.chart
+
+    def _show_chart_window(self) -> None:
+        chart = self._ensure_chart()
+        if chart is None:
+            return
+        if not self.chart_shown:
+            chart.show()
+            self.chart_shown = True
+        if self.chart_data is not None:
+            self._set_chart_data(self.chart_data)
+
+    def _prepare_chart_frame(self, df):
+        import pandas as pd
+
+        formatted = df.copy()
+        if 'time' in formatted.columns:
+            formatted['time'] = pd.to_datetime(formatted['time'], utc=True)
+            formatted['time'] = formatted['time'].dt.strftime('%Y-%m-%dT%H:%M:%S')
+        return formatted
+
+    def _set_chart_data(self, df) -> None:
+        if df is None or df.empty:
+            return
+
+        chart = self._ensure_chart()
+        if chart is None:
+            return
+
+        formatted = self._prepare_chart_frame(df)
+        required_cols = ["time", "open", "high", "low", "close"]
+        if not all(col in formatted.columns for col in required_cols):
+            logging.error("Missing required OHLC columns for chart rendering")
+            return
+
+        chart.set(formatted[["time", "open", "high", "low", "close", "volume"]] if "volume" in formatted.columns else formatted[required_cols])
+        chart.watermark(f"{self.ticker} {self.current_timeframe}")
+        self.chart_status.setText(
+            f"Loaded {len(formatted)} bars for {self.ticker} ({self.current_timeframe})"
+        )
+        self.last_update_label.setText(
+            f"Last update: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC"
+        )
+        self._refresh_indicators(formatted)
+
+    def _update_chart_bar(self, bar: Dict[str, Any]) -> None:
+        chart = self._ensure_chart()
+        if chart is None:
+            return
+
+        import pandas as pd
+
+        update_bar = dict(bar)
+        if 'time' in update_bar:
+            update_bar['time'] = pd.to_datetime(update_bar['time'], utc=True).strftime('%Y-%m-%dT%H:%M:%S')
+
+        series = pd.Series(update_bar)
+        chart.update(series)
+
+        for column, line in list(self.indicator_lines.items()):
+            value = update_bar.get(column)
+            if value is None:
+                continue
+            line.update({'time': update_bar['time'], line.name: value})
+
+    def _refresh_indicators(self, formatted_df) -> None:
+        chart = self._ensure_chart()
+        if chart is None:
+            return
+
+        import pandas as pd
+
+        for column, line in list(self.indicator_lines.items()):
+            if column not in formatted_df.columns or all(formatted_df[column].isna()):
+                line.delete()
+                self.indicator_lines.pop(column, None)
+
+        for key, columns in self.INDICATOR_GROUPS.items():
+            if not self.indicator_state.get(key, False):
+                for column, _, _ in columns:
+                    line = self.indicator_lines.pop(column, None)
+                    if line:
+                        line.delete()
+                continue
+
+            for column, label, color in columns:
+                if column not in formatted_df.columns:
+                    continue
+                series_df = formatted_df[["time", column]].dropna()
+                if series_df.empty:
+                    continue
+                line = self.indicator_lines.get(column)
+                if line is None:
+                    line = chart.create_line(label, color=color)
+                    self.indicator_lines[column] = line
+                line.set(series_df.rename(columns={column: label}))
+
+    def _on_indicator_toggle(self, key: str, state: int) -> None:
+        self.indicator_state[key] = state == Qt.CheckState.Checked.value
+        if self.chart_data is not None:
+            formatted = self._prepare_chart_frame(self.chart_data)
+            self._refresh_indicators(formatted)
+
+    # ------------------------------------------------------------------
+    # DATA LOADING / STREAMING
+    # ------------------------------------------------------------------
+    def _start_worker(self) -> None:
+        from dotenv import load_dotenv
+
+        load_dotenv()
+        self.api_key = os.getenv('POLYGON_API_KEY', '')
+        if not self.api_key:
+            self.status_label.setText("❌ No API key in .env")
+            return
+
+        self.ticker = self.ticker_input.text().strip().upper()
+        if not self.ticker:
+            self.status_label.setText("❌ Enter ticker")
+            return
+
+        self._stop_worker()
+
+        self.worker = PolygonDataWorker(self.ticker, self.api_key)
+        self.worker.candle_signal.connect(self._on_candle)
+        self.worker.indicator_signal.connect(self._on_indicators)
+        self.worker.news_signal.connect(self._on_news)
+        self.worker.reference_signal.connect(self._on_reference)
+        self.worker.corporate_signal.connect(self._on_corporate)
+        self.worker.status_signal.connect(self._on_status)
+        self.worker.error_signal.connect(self._on_error)
+        self.worker.start()
+
+        self.candles.clear()
+        self.indicator_arrays.clear()
+        self.news_articles.clear()
+        self.reference_data.clear()
+        self.dividends.clear()
+        self.splits.clear()
+
+    def _stop_worker(self) -> None:
+        if self.worker:
+            self.worker.stop()
+            self.worker.wait()
+            self.worker = None
+
+    def _start_redis_subscriber(self) -> None:
+        if not REDIS_AVAILABLE:
+            self.status_label.setText("❌ Redis library missing")
+            return
+
+        self.ticker = self.ticker_input.text().strip().upper()
+        if not self.ticker:
+            self.status_label.setText("❌ Enter ticker")
+            return
+
+        redis_password = os.getenv('REDIS_PASSWORD', None)
+        redis_port = int(os.getenv('REDIS_PORT', '6380'))
+
+        try:
+            test_client = redis.Redis(
+                host='localhost',
+                port=redis_port,
+                password=redis_password,
+                socket_connect_timeout=2,
+            )
+            test_client.ping()
+            test_client.close()
+        except redis.AuthenticationError:
+            self.status_label.setText("⚠️ Redis auth failed")
             self._reload_chart_data()
-        
-        def _on_redis_disconnected(self):
-            """Handle Redis disconnection"""
-            logging.warning("Redis subscriber disconnected")
+            return
+        except (redis.ConnectionError, redis.TimeoutError) as exc:
+            logging.warning(f"Redis unavailable: {exc}")
+            self.status_label.setText("⚠️ Redis offline - DB fallback")
+            self._reload_chart_data()
+            return
+
+        if self.redis_subscriber and self.redis_subscriber.isRunning():
+            self.redis_subscriber.stop()
+
+        self.redis_subscriber = RedisSubscriberThread(
+            symbols=[self.ticker],
+            timeframes=[self.current_timeframe],
+            redis_host='localhost',
+            redis_port=redis_port,
+            redis_password=redis_password,
+        )
+        self.redis_subscriber.bar_received.connect(self._on_redis_bar)
+        self.redis_subscriber.error_occurred.connect(self._on_redis_error)
+        self.redis_subscriber.connected.connect(self._on_redis_connected)
+        self.redis_subscriber.disconnected.connect(self._on_redis_disconnected)
+        self.redis_subscriber.start()
+
+        self.redis_btn.setEnabled(False)
+        self.websocket_btn.setEnabled(False)
+        self.disconnect_btn.setEnabled(True)
+        self.status_label.setText("🔄 Connecting to Redis...")
+
+    def _start_redis_live(self) -> None:
+        self.resume_live_btn.setEnabled(False)
+        self._reload_chart_data(trigger_redis_after=True)
+
+    def _stop_redis_subscriber(self) -> None:
+        if self.redis_subscriber and self.redis_subscriber.isRunning():
+            self.redis_subscriber.stop()
+            self.redis_subscriber = None
             self.status_label.setText("⚫ Redis disconnected")
-        
-        def _apply_date_range(self):
-            """Apply date range filter and reload chart data"""
-            try:
-                # Get date range from UI
-                start_date = self.start_date_edit.date().toPyDate()
-                end_date = self.end_date_edit.date().toPyDate()
-                
-                # Convert to datetime with timezone
-                from datetime import datetime
-                import pytz
-                start_dt = datetime.combine(start_date, datetime.min.time()).replace(tzinfo=pytz.UTC)
-                end_dt = datetime.combine(end_date, datetime.max.time()).replace(tzinfo=pytz.UTC)
-                
-                logging.info(f"Loading historical data: {start_date} to {end_date}")
-                
-                # Stop live updates if running
-                if self.redis_subscriber and self.redis_subscriber.isRunning():
-                    self.redis_subscriber.stop()
-                    self.redis_subscriber = None
-                
-                # Reload data with date range using ChartDataInitialLoader
-                self.ticker = self.ticker_input.text().strip().upper()
-                if not self.ticker:
-                    self.status_label.setText("❌ Enter ticker")
-                    return
-                
-                # Create background data loader with date range
-                self.data_loader = ChartDataInitialLoader(
-                    ticker=self.ticker,
-                    timeframe=self.current_timeframe,
-                    limit=100000,
-                    start_date=start_dt,
-                    end_date=end_dt
-                )
-                self.data_loader.data_loaded.connect(self._on_data_loaded)
-                self.data_loader.error_occurred.connect(self._on_data_load_error)
-                self.data_loader.start()
-                
-                self.status_label.setText(f"📅 Loading {start_date} to {end_date}...")
-                
-                # Enable "Resume Live" button
-                self.resume_live_btn.setEnabled(True)
-                
-            except Exception as e:
-                logging.error(f"Date range application error: {e}", exc_info=True)
-                self.status_label.setText(f"❌ Error: {str(e)}")
-        
-        def _start_redis_live(self):
-            """Resume Redis live updates with gap-filling"""
-            try:
-                # First, load latest data from DB to fill any gaps
-                self.ticker = self.ticker_input.text().strip().upper()
-                if not self.ticker:
-                    self.status_label.setText("❌ Enter ticker")
-                    return
-                
-                logging.info(f"Resuming Redis live for {self.ticker} @ {self.current_timeframe}")
-                
-                # Reload current data from DB (clears date range filter)
-                self.data_loader = ChartDataInitialLoader(
-                    ticker=self.ticker,
-                    timeframe=self.current_timeframe,
-                    limit=10000
-                )
-                self.data_loader.data_loaded.connect(self._on_data_loaded_then_redis)
-                self.data_loader.error_occurred.connect(self._on_data_load_error)
-                self.data_loader.start()
-                
-                self.status_label.setText("🔄 Gap-filling from DB...")
-                self.resume_live_btn.setEnabled(False)
-                
-            except Exception as e:
-                logging.error(f"Redis live resume error: {e}", exc_info=True)
-                self.status_label.setText(f"❌ Error: {str(e)}")
-        
-        def _on_data_loaded_then_redis(self, df):
-            """Callback after gap-fill: update chart, then start Redis"""
-            self._on_data_loaded(df)
-            # Now start Redis subscriber
-            self._start_redis_subscriber()
-        
-        def _toggle_indicator(self, indicator: str):
-            """Toggle indicator visibility"""
-            if indicator == 'sma':
-                self.show_sma = self.sma_check.isChecked()
-            elif indicator == 'ema':
-                self.show_ema = self.ema_check.isChecked()
-            elif indicator == 'bb':
-                self.show_bb = self.bb_check.isChecked()
-            elif indicator == 'vwap':
-                self.show_vwap = self.vwap_check.isChecked()
-            
-            self._update_chart()
-        
-        def _on_candle(self, ticker: str, candle: dict):
-            """Handle new candle from WebSocket"""
-            self.candles.append(candle)
-            
-            # Throttle chart updates (every 2 seconds)
-            if (datetime.now() - self._last_chart_update).total_seconds() > 2:
-                self._update_chart()
-                self._last_chart_update = datetime.now()
-        
-        def _on_indicators(self, ticker: str, indicators: dict):
-            """Handle updated indicators"""
-            self.indicators = indicators
-            self._update_chart()
-        
-        def _on_news(self, articles: list):
-            """Handle news articles"""
-            self.news_articles = articles
-            self._update_news()
-        
-        def _on_reference(self, data: dict):
-            """Handle reference data"""
-            self.reference_data = data
-            self._update_reference_table()
-        
-        def _on_corporate(self, data: dict):
-            """Handle corporate actions"""
-            self.dividends = data.get('dividends', [])
-            self.splits = data.get('splits', [])
-            self._update_corporate_table()
-            self._update_chart()  # Redraw with corporate actions
-        
-        def _on_status(self, status: str):
-            """Handle status updates"""
-            self.status_label.setText(status)
-        
-        def _on_error(self, error: str):
-            """Handle errors"""
-            logging.error(f"Market Data Error: {error}")
-        
-        def _update_chart(self):
-            """Legacy chart update method - now using lightweight-charts"""
-            # This method is kept for compatibility with old code paths
-            # The actual chart updates happen in _update_lightweight_chart
-            pass
-        
-        def _update_news(self):
-            """Update news feed"""
-            html = "<html><body style='background-color: #1e1e1e; color: #d4d4d4; font-family: Arial;'>"
-            
-            for article in self.news_articles[:10]:
-                title = article.get('title', 'No title')
-                published = article.get('published_utc', '')
-                url = article.get('article_url', '#')
-                
-                html += f"""
-                <div style='margin-bottom: 15px; border-bottom: 1px solid #444; padding-bottom: 10px;'>
-                    <a href='{url}' style='color: #42A5F5; text-decoration: none; font-weight: bold;'>{title}</a>
-                    <br><span style='color: #888; font-size: 11px;'>{published}</span>
-                </div>
-                """
-            
-            html += "</body></html>"
-            self.news_text.setHtml(html)
-        
-        def _on_search(self, chart_obj, searched_string):
-            """Handle search in topbar (ticker search)"""
-            new_ticker = searched_string.strip().upper()
-            if not new_ticker or new_ticker == self.ticker:
-                return
-            
-            # Update ticker
-            self.ticker = new_ticker
-            self.ticker_input.setText(new_ticker)
-            self.chart.topbar['symbol'].set(new_ticker)
-            
-            # Reload data for new ticker
-            self._reload_chart_data()
-        
-        def _on_timeframe_change(self, chart_obj):
-            """Handle timeframe selection from topbar"""
-            new_timeframe = self.chart.topbar['timeframe'].value
-            if new_timeframe == self.current_timeframe:
-                return
-            
-            # Update timeframe
-            self.current_timeframe = new_timeframe
-            
-            # Update button states in the GUI
-            for tf, btn in self.timeframe_buttons.items():
-                btn.setChecked(tf == new_timeframe)
-            
-            # Reload data
-            self._reload_chart_data()
-        
-        def _change_timeframe(self, timeframe: str):
-            """Change chart timeframe (called from button clicks)"""
-            if timeframe == self.current_timeframe:
-                return
-            
-            # Update button states
-            for tf, btn in self.timeframe_buttons.items():
-                btn.setChecked(tf == timeframe)
-            
-            self.current_timeframe = timeframe
-            
-            # Update chart topbar
-            if hasattr(self, 'chart') and self.chart:
-                self.chart.topbar['timeframe'].set(timeframe)
-            
-            # Reload data
-            self._reload_chart_data()
-        
-        def _set_mode(self, mode: str):
-            """Set price or percentage display mode"""
-            self.display_mode = mode
-            self.price_mode_btn.setChecked(mode == 'price')
-            self.pct_mode_btn.setChecked(mode == 'percentage')
-            
-            if mode == 'percentage' and hasattr(self, 'chart_data') and self.chart_data is not None and not self.chart_data.empty:
-                self.reference_price = self.chart_data['close'].iloc[0]
-            
-            # Trigger chart reload with new mode
-            self._request_chart_update()
-        
-        def _reload_chart_data(self):
-            """
-            Reload chart data asynchronously from TimescaleDB (initial load only).
-            After initial load, all updates come via Redis Pub/Sub.
-            """
-            # Show loading overlay
-            self._show_loading(True)
-            
-            # Cancel flag
-            self.cancel_load = False
-            
-            # Start background thread for initial DB load
-            self.data_loader = ChartDataInitialLoader(
-                ticker=self.ticker,
-                timeframe=self.current_timeframe,
-                limit=10000
-            )
+        self.redis_btn.setEnabled(True)
+        self.websocket_btn.setEnabled(True)
+        self.disconnect_btn.setEnabled(False)
+
+    def _stop_all(self) -> None:
+        self._stop_worker()
+        self._stop_redis_subscriber()
+
+    def _reload_chart_data(self, trigger_redis_after: bool = False) -> None:
+        if self.data_loader and self.data_loader.isRunning():
+            self.cancel_load = True
+            self.data_loader.quit()
+
+        self.cancel_load = False
+        self.data_loader = ChartDataInitialLoader(
+            ticker=self.ticker,
+            timeframe=self.current_timeframe,
+            limit=10000,
+        )
+        if trigger_redis_after:
+            self.data_loader.data_loaded.connect(self._on_data_loaded_then_redis)
+        else:
             self.data_loader.data_loaded.connect(self._on_data_loaded)
-            self.data_loader.error_occurred.connect(self._on_data_error)
-            self.data_loader.start()
-        
-        def _on_data_loaded(self, df):
-            """Handle initial data loaded from TimescaleDB"""
-            if self.cancel_load:
+        self.data_loader.error_occurred.connect(self._on_data_error)
+        self.data_loader.start()
+        self.chart_status.setText("Loading historical data from TimescaleDB...")
+
+    # ------------------------------------------------------------------
+    # REDIS CALLBACKS
+    # ------------------------------------------------------------------
+    def _on_redis_bar(self, bar_data: dict) -> None:
+        try:
+            if bar_data.get('symbol') and bar_data['symbol'] != self.ticker:
                 return
-            
-            self.chart_data = df
-            self.indicator_arrays = {}
-            self.chart_patterns = {}  # Store pattern data
-            
-            # Extract indicators (already computed in DB)
-            if not df.empty:
-                import numpy as np
-                for col in ['sma_20', 'sma_50', 'ema_20', 'ema_50', 'ema_100', 'ema_200',
-                            'vwap', 'bb_upper', 'bb_middle', 'bb_lower',
-                            'rsi_14', 'macd', 'macd_signal', 'macd_hist']:
-                    if col in df.columns:
-                        self.indicator_arrays[col] = df[col].values
-                
-                # Extract chart patterns from DataFrame attrs
-                if hasattr(df, 'attrs') and 'chart_patterns' in df.attrs:
-                    self.chart_patterns = df.attrs['chart_patterns']
-                
-                logging.info(f"✓ Loaded {len(df)} bars for {self.ticker} ({self.current_timeframe})")
-            
-            self._show_loading(False)
-            self._request_chart_update()
-            
-            # Show chart window if available
-            if self.chart and not df.empty:
-                try:
-                    self.chart.show(block=False)
-                except Exception as e:
-                    logging.debug(f"Chart window already open or error: {e}")
-        
-        def _on_data_error(self, error_msg):
-            """Handle data load error"""
-            self._show_loading(False)
-            logging.error(f"Chart data load error: {error_msg}")
-            self.status_label.setText(f"❌ {error_msg}")
-        
-        def _on_data_load_error(self, error_msg):
-            """Alias for _on_data_error for compatibility"""
-            self._on_data_error(error_msg)
-        
-        def _show_loading(self, show: bool):
-            """Show/hide loading overlay"""
-        def _toggle_loading_overlay(self, show: bool):
-            """Show/hide loading overlay - TODO: Implement in backend"""
-            try:
-                # TODO: Add loading overlay support to ChartBackend interface
-                # Currently disabled due to backend refactor
-                pass
-            except Exception as e:
-                logging.debug(f"Loading overlay error: {e}")
-        
-        def _request_chart_update(self):
-            """Request chart update with lightweight-charts"""
-            if self.chart is None:
-                return
-            
-            # Directly update chart (no throttling needed - lightweight-charts handles it)
-            self._update_lightweight_chart()
-        
-        def _update_lightweight_chart(self):
-            """Update chart using lightweight-charts library"""
-            try:
-                if not hasattr(self, 'chart') or self.chart is None:
-                    return
-                
-                if not hasattr(self, 'chart_data') or self.chart_data is None or self.chart_data.empty:
-                    return
-                
-                import pandas as pd
-                
-                # Prepare data for lightweight-charts
-                df = self.chart_data.copy()
-                
-                # Ensure required columns exist
-                required_cols = ['time', 'open', 'high', 'low', 'close']
-                if not all(col in df.columns for col in required_cols):
-                    logging.error(f"Missing required columns. Have: {df.columns.tolist()}")
-                    return
-                
-                # Convert time to datetime if needed
-                if df['time'].dtype == 'object' or not pd.api.types.is_datetime64_any_dtype(df['time']):
-                    df['time'] = pd.to_datetime(df['time'])
-                
-                # Apply percentage mode if enabled
-                if self.display_mode == 'percentage' and self.reference_price:
-                    for col in ['open', 'high', 'low', 'close']:
-                        if col in df.columns:
-                            df[col] = ((df[col] / self.reference_price) - 1) * 100
-                
-                # Set main candlestick data
-                self.chart.set(df[required_cols])
-                
-                # Clear previous indicators
-                for line_name in list(self.indicator_lines.keys()):
-                    try:
-                        # Note: lightweight-charts doesn't have a direct remove method
-                        # We'll just overwrite on next update
-                        pass
-                    except:
-                        pass
-                self.indicator_lines.clear()
-                
-                # Add indicators based on toggles
-                if self.show_sma and 'sma_20' in df.columns:
-                    sma20_line = self.chart.create_line('SMA 20', color='#FFA726')
-                    sma20_data = pd.DataFrame({
-                        'time': df['time'],
-                        'SMA 20': df['sma_20']
-                    }).dropna()
-                    if not sma20_data.empty:
-                        sma20_line.set(sma20_data)
-                        self.indicator_lines['sma_20'] = sma20_line
-                
-                if self.show_sma and 'sma_50' in df.columns:
-                    sma50_line = self.chart.create_line('SMA 50', color='#AB47BC')
-                    sma50_data = pd.DataFrame({
-                        'time': df['time'],
-                        'SMA 50': df['sma_50']
-                    }).dropna()
-                    if not sma50_data.empty:
-                        sma50_line.set(sma50_data)
-                        self.indicator_lines['sma_50'] = sma50_line
-                
-                if self.show_ema and 'ema_20' in df.columns:
-                    ema20_line = self.chart.create_line('EMA 20', color='#42A5F5')
-                    ema20_data = pd.DataFrame({
-                        'time': df['time'],
-                        'EMA 20': df['ema_20']
-                    }).dropna()
-                    if not ema20_data.empty:
-                        ema20_line.set(ema20_data)
-                        self.indicator_lines['ema_20'] = ema20_line
-                
-                if self.show_ema and 'ema_50' in df.columns:
-                    ema50_line = self.chart.create_line('EMA 50', color='#66BB6A')
-                    ema50_data = pd.DataFrame({
-                        'time': df['time'],
-                        'EMA 50': df['ema_50']
-                    }).dropna()
-                    if not ema50_data.empty:
-                        ema50_line.set(ema50_data)
-                        self.indicator_lines['ema_50'] = ema50_line
-                
-                if self.show_vwap and 'vwap' in df.columns:
-                    vwap_line = self.chart.create_line('VWAP', color='#FDD835')
-                    vwap_data = pd.DataFrame({
-                        'time': df['time'],
-                        'VWAP': df['vwap']
-                    }).dropna()
-                    if not vwap_data.empty:
-                        vwap_line.set(vwap_data)
-                        self.indicator_lines['vwap'] = vwap_line
-                
-                if self.show_bb and 'bb_upper' in df.columns:
-                    bb_upper_line = self.chart.create_line('BB Upper', color='#78909C', style='dotted')
-                    bb_upper_data = pd.DataFrame({
-                        'time': df['time'],
-                        'BB Upper': df['bb_upper']
-                    }).dropna()
-                    if not bb_upper_data.empty:
-                        bb_upper_line.set(bb_upper_data)
-                        self.indicator_lines['bb_upper'] = bb_upper_line
-                
-                if self.show_bb and 'bb_middle' in df.columns:
-                    bb_middle_line = self.chart.create_line('BB Middle', color='#78909C')
-                    bb_middle_data = pd.DataFrame({
-                        'time': df['time'],
-                        'BB Middle': df['bb_middle']
-                    }).dropna()
-                    if not bb_middle_data.empty:
-                        bb_middle_line.set(bb_middle_data)
-                        self.indicator_lines['bb_middle'] = bb_middle_line
-                
-                if self.show_bb and 'bb_lower' in df.columns:
-                    bb_lower_line = self.chart.create_line('BB Lower', color='#78909C', style='dotted')
-                    bb_lower_data = pd.DataFrame({
-                        'time': df['time'],
-                        'BB Lower': df['bb_lower']
-                    }).dropna()
-                    if not bb_lower_data.empty:
-                        bb_lower_line.set(bb_lower_data)
-                        self.indicator_lines['bb_lower'] = bb_lower_line
-                
-                # Note: RSI and MACD would require subchart support
-                # lightweight-charts-python supports this but requires different API
-                # For now, focusing on main chart indicators
-                
-                logging.debug(f"Chart updated with {len(df)} bars, {len(self.indicator_lines)} indicators")
-                
-            except Exception as e:
-                logging.error(f"Chart update error: {e}", exc_info=True)
-        
-        def _toggle_indicator(self, indicator: str):
-            """Toggle indicator visibility - efficient in-place update"""
-            if indicator == 'sma':
-                self.show_sma = self.sma_check.isChecked()
-            elif indicator == 'ema':
-                self.show_ema = self.ema_check.isChecked()
-            elif indicator == 'bb':
-                self.show_bb = self.bb_check.isChecked()
-            elif indicator == 'vwap':
-                self.show_vwap = self.vwap_check.isChecked()
-            elif indicator == 'rsi':
-                self.show_rsi = self.rsi_check.isChecked()
-            elif indicator == 'macd':
-                self.show_macd = self.macd_check.isChecked()
-            
-            # Request throttled chart update
-            self._request_chart_update()
-        
-        def _update_reference_table(self):
-            """Update reference data table"""
-            self.ref_table.setRowCount(0)
-            
-            if not self.reference_data:
-                return
-            
-            fields = [
-                ('name', 'Company Name'),
-                ('market', 'Exchange'),
-                ('type', 'Type'),
-                ('market_cap', 'Market Cap'),
-                ('currency_name', 'Currency'),
-                ('primary_exchange', 'Primary Exchange'),
-            ]
-            
-            self.ref_table.setRowCount(len(fields))
-            
-            for row, (key, label) in enumerate(fields):
-                value = self.reference_data.get(key, 'N/A')
-                
-                # Format market cap
-                if key == 'market_cap' and isinstance(value, (int, float)):
-                    value = f"${value / 1e9:.2f}B"
-                
-                self.ref_table.setItem(row, 0, QTableWidgetItem(label))
-                self.ref_table.setItem(row, 1, QTableWidgetItem(str(value)))
-        
-        def _update_corporate_table(self):
-            """Update corporate actions table"""
-            self.corp_table.setRowCount(0)
-            
-            actions = []
-            
-            for div in self.dividends[:20]:
-                actions.append({
-                    'date': div.get('ex_dividend_date', 'N/A'),
-                    'type': 'Dividend',
-                    'amount': f"${div.get('cash_amount', 0):.4f}",
-                    'details': f"Pay: {div.get('pay_date', 'N/A')}"
-                })
-            
-            for split in self.splits[:20]:
-                actions.append({
-                    'date': split.get('execution_date', 'N/A'),
-                    'type': 'Split',
-                    'amount': f"{split.get('split_from', 1)}:{split.get('split_to', 1)}",
-                    'details': ''
-                })
-            
-            # Sort by date descending
-            actions.sort(key=lambda x: x['date'], reverse=True)
-            
-            self.corp_table.setRowCount(len(actions))
-            
-            for row, action in enumerate(actions):
-                self.corp_table.setItem(row, 0, QTableWidgetItem(action['date'][:10]))
-                
-                type_item = QTableWidgetItem(action['type'])
-                if action['type'] == 'Dividend':
-                    type_item.setForeground(QColor('#4CAF50'))
+
+            import pandas as pd
+
+            new_row = pd.DataFrame([bar_data])
+            if 'time' in new_row.columns:
+                new_row['time'] = pd.to_datetime(new_row['time'])
+
+            if self.chart_data is None or getattr(self.chart_data, 'empty', True):
+                self.chart_data = new_row
+                self._set_chart_data(self.chart_data)
+            else:
+                last_time = self.chart_data['time'].iloc[-1]
+                new_time = new_row['time'].iloc[0]
+                if new_time <= last_time:
+                    self.chart_data.iloc[-1] = new_row.iloc[0]
                 else:
-                    type_item.setForeground(QColor('#FF9800'))
-                self.corp_table.setItem(row, 1, type_item)
-                
-                self.corp_table.setItem(row, 2, QTableWidgetItem(action['amount']))
-                self.corp_table.setItem(row, 3, QTableWidgetItem(action['details']))
+                    self.chart_data = pd.concat([self.chart_data, new_row], ignore_index=True)
+                self._update_chart_bar(new_row.iloc[0].to_dict())
+
+            self.last_update_label.setText(
+                f"Last update: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC"
+            )
+        except Exception as exc:
+            logging.error(f"Redis bar update error: {exc}", exc_info=True)
+
+    def _on_redis_error(self, message: str) -> None:
+        logging.error(f"Redis error: {message}")
+        self.status_label.setText(f"❌ Redis error: {message}")
+
+    def _on_redis_connected(self) -> None:
+        logging.info("Redis subscriber connected")
+        self.status_label.setText("✅ Redis connected - streaming live data")
+        self._reload_chart_data()
+
+    def _on_redis_disconnected(self) -> None:
+        logging.warning("Redis subscriber disconnected")
+        self.status_label.setText("⚫ Redis disconnected")
+        self.redis_btn.setEnabled(True)
+        self.websocket_btn.setEnabled(True)
+        self.disconnect_btn.setEnabled(False)
+
+    # ------------------------------------------------------------------
+    # DATA LOADER CALLBACKS
+    # ------------------------------------------------------------------
+    def _on_data_loaded(self, df) -> None:
+        if self.cancel_load:
+            return
+
+        self.chart_data = df
+        self.indicator_arrays = {}
+        if not df.empty:
+            for column in df.columns:
+                if column.startswith(('sma_', 'ema_', 'bb_', 'vwap', 'rsi', 'macd')):
+                    self.indicator_arrays[column] = df[column].values
+
+        self._set_chart_data(df)
+        self.resume_live_btn.setEnabled(True)
+
+    def _on_data_loaded_then_redis(self, df) -> None:
+        self._on_data_loaded(df)
+        self._start_redis_subscriber()
+
+    def _on_data_error(self, message: str) -> None:
+        logging.error(f"Data load error: {message}")
+        self.chart_status.setText(message)
+
+    # ------------------------------------------------------------------
+    # WORKER CALLBACKS (LEGACY POLYGON WS)
+    # ------------------------------------------------------------------
+    def _on_candle(self, ticker: str, candle: dict) -> None:
+        self.candles.append(candle)
+        if (datetime.now() - self._last_chart_update).total_seconds() > 2:
+            if self.chart_data is not None and not getattr(self.chart_data, 'empty', True):
+                self._set_chart_data(self.chart_data)
+            self._last_chart_update = datetime.now()
+
+    def _on_indicators(self, ticker: str, indicators: dict) -> None:
+        self.indicator_arrays.update(indicators)
+        if self.chart_data is not None and not getattr(self.chart_data, 'empty', True):
+            formatted = self._prepare_chart_frame(self.chart_data)
+            self._refresh_indicators(formatted)
+
+    def _on_news(self, articles: list) -> None:
+        self.news_articles = articles
+        self._update_news()
+
+    def _on_reference(self, data: dict) -> None:
+        self.reference_data = data
+        self._update_reference_table()
+
+    def _on_corporate(self, data: dict) -> None:
+        self.dividends = data.get('dividends', [])
+        self.splits = data.get('splits', [])
+        self._update_corporate_table()
+
+    def _on_status(self, status: str) -> None:
+        self.status_label.setText(status)
+
+    def _on_error(self, error: str) -> None:
+        logging.error(f"Market data worker error: {error}")
+
+    # ------------------------------------------------------------------
+    # NEWS / REFERENCE PANELS
+    # ------------------------------------------------------------------
+    def _update_news(self) -> None:
+        html = [
+            "<html><body style='background-color:#1e1e1e; color:#d4d4d4; font-family:Arial;'>"
+        ]
+        for article in self.news_articles[:10]:
+            title = article.get('title', 'No title')
+            published = article.get('published_utc', '')
+            url = article.get('article_url', '#')
+            html.append(
+                f"<div style='margin-bottom:12px;border-bottom:1px solid #444;padding-bottom:8px;'>"
+                f"<a href='{url}' style='color:#42A5F5;text-decoration:none;font-weight:bold;'>{title}</a>"
+                f"<br><span style='color:#888;font-size:11px;'>{published}</span>"
+                "</div>"
+            )
+        html.append("</body></html>")
+        self.news_text.setHtml("".join(html))
+
+    def _update_reference_table(self) -> None:
+        self.ref_table.setRowCount(0)
+        if not self.reference_data:
+            return
+        fields = [
+            ('name', 'Company Name'),
+            ('market', 'Exchange'),
+            ('type', 'Type'),
+            ('market_cap', 'Market Cap'),
+            ('currency_name', 'Currency'),
+            ('primary_exchange', 'Primary Exchange'),
+        ]
+        self.ref_table.setRowCount(len(fields))
+        for row, (key, label) in enumerate(fields):
+            value = self.reference_data.get(key, 'N/A')
+            if key == 'market_cap' and isinstance(value, (int, float)):
+                value = f"${value/1e9:.2f}B"
+            self.ref_table.setItem(row, 0, QTableWidgetItem(label))
+            self.ref_table.setItem(row, 1, QTableWidgetItem(str(value)))
+
+    def _update_corporate_table(self) -> None:
+        self.corp_table.setRowCount(0)
+        actions = []
+        for div in self.dividends[:20]:
+            actions.append({
+                'date': div.get('ex_dividend_date', 'N/A'),
+                'type': 'Dividend',
+                'amount': f"${div.get('cash_amount', 0):.4f}",
+                'details': f"Pay: {div.get('pay_date', 'N/A')}",
+            })
+        for split in self.splits[:20]:
+            actions.append({
+                'date': split.get('execution_date', 'N/A'),
+                'type': 'Split',
+                'amount': f"{split.get('split_from', 1)}:{split.get('split_to', 1)}",
+                'details': '',
+            })
+        actions.sort(key=lambda item: item['date'], reverse=True)
+        self.corp_table.setRowCount(len(actions))
+        for row, action in enumerate(actions):
+            self.corp_table.setItem(row, 0, QTableWidgetItem(action['date'][:10]))
+            type_item = QTableWidgetItem(action['type'])
+            type_item.setForeground(QColor('#4CAF50' if action['type'] == 'Dividend' else '#FF9800'))
+            self.corp_table.setItem(row, 1, type_item)
+            self.corp_table.setItem(row, 2, QTableWidgetItem(action['amount']))
+            self.corp_table.setItem(row, 3, QTableWidgetItem(action['details']))
+
+    # ------------------------------------------------------------------
+    # CHART EVENT CALLBACKS
+    # ------------------------------------------------------------------
+    def _on_chart_search(self, chart_obj, searched_string: str) -> None:
+        ticker = searched_string.strip().upper()
+        if not ticker or ticker == self.ticker:
+            return
+        self.ticker = ticker
+        self.ticker_input.setText(ticker)
+        self._reload_chart_data(trigger_redis_after=True)
+
+    def _on_chart_timeframe_change(self, chart_obj) -> None:
+        timeframe = chart_obj.topbar['timeframe'].value
+        if timeframe == self.current_timeframe:
+            return
+        self.current_timeframe = timeframe
+        self._reload_chart_data(trigger_redis_after=True)
+
+    def _on_chart_resume(self, chart_obj) -> None:
+        self._start_redis_live()
 
 
 class BackfillVisualizer(QMainWindow):

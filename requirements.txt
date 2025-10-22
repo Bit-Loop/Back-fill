@@ -1,0 +1,21 @@
+# Core dependencies
+python-dotenv>=1.0.0
+psycopg2-binary>=2.9.0
+requests>=2.31.0
+urllib3>=2.0.0
+tqdm>=4.66.0
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Streaming dependencies
+redis>=5.0.0
+confluent-kafka>=2.3.0
+websocket-client>=1.6.0
+
+# GUI dependencies (optional)
+PyQt6>=6.6.0
+lightweight-charts>=2.0.0
+
+# Optional dependencies
+boto3>=1.34.0  # For S3 flat files
+psutil>=5.9.0  # For CPU monitoring

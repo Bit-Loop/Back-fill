@@ -47,6 +47,8 @@ class S3Config:
             self.access_key = os.getenv('POLYGON_S3_ACCESS_KEY')
         if self.secret_key is None:
             self.secret_key = os.getenv('POLYGON_S3_SECRET_KEY')
+        self.endpoint = os.getenv('POLYGON_S3_ENDPOINT', self.endpoint)
+        self.bucket = os.getenv('POLYGON_S3_BUCKET', self.bucket)
 
 
 @dataclass
@@ -58,6 +60,19 @@ class RedisConfig:
     password: Optional[str] = None
     
     def __post_init__(self):
+        self.host = os.getenv('REDIS_HOST', self.host)
+        port_value = os.getenv('REDIS_PORT')
+        if port_value is not None:
+            try:
+                self.port = int(port_value)
+            except ValueError:
+                pass
+        db_value = os.getenv('REDIS_DB')
+        if db_value is not None:
+            try:
+                self.db = int(db_value)
+            except ValueError:
+                pass
         if self.password is None:
             self.password = os.getenv('REDIS_PASSWORD')
 
@@ -72,11 +87,22 @@ class DatabaseConfig:
     password: Optional[str] = None
     
     def __post_init__(self):
-        self.host = self.host or os.getenv('DB_HOST', 'localhost')
-        self.port = self.port or int(os.getenv('DB_PORT', '5432'))
-        self.database = self.database or os.getenv('DB_NAME', 'trading')
-        self.user = self.user or os.getenv('DB_USER', 'postgres')
-        self.password = self.password or os.getenv('DB_PASSWORD')
+        def _env(*names: str, default: Optional[str] = None) -> Optional[str]:
+            for name in names:
+                value = os.getenv(name)
+                if value:
+                    return value
+            return default
+
+        self.host = self.host or _env('DB_HOST', 'TIMESCALE_HOST', default='localhost')
+        port_value = self.port or _env('DB_PORT', 'TIMESCALE_PORT', default='5432')
+        try:
+            self.port = int(port_value) if port_value is not None else 5432
+        except ValueError:
+            self.port = 5432
+        self.database = self.database or _env('DB_NAME', 'TIMESCALE_DB', default='trading')
+        self.user = self.user or _env('DB_USER', 'TIMESCALE_USER', default='postgres')
+        self.password = self.password or _env('DB_PASSWORD', 'TIMESCALE_PASSWORD')
 
 
 @dataclass

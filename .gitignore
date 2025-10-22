@@ -1,0 +1,91 @@
+# Environment
+.env
+.env.local
+.venv/
+venv/
+env/
+ENV/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# Data files
+data/flat_files/*.gz
+data/flat_files/*.csv
+data/flat_files/*.json
+data/raw/
+data/processed/
+*.csv*
+*.json
+*.parquet
+
+# Logs
+logs/
+*.log
+test_output.log
+
+# Models and checkpoints
+models/saved_models/
+models/checkpoints/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Databases
+*.sqlite
+*.db
+airflow.db
+airflow-webserver.pid
+
+# Testing
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Other
+node_modules/
+*.tfstate
+*.tfstate.backup
+.terraform/
+docker-compose.override.yml
+mlruns/
+
+# Documentation that's temporary
+*_SUMMARY.md
+*_REPORT.md
+*_STATUS.md
+*_FIXES.md
+*_COMPLETE.md
+*_RESULTS.md
+TEST_*.md
+VISUALIZER_*.md
+REFACTOR_*.md
+STREAMING_*.md
+KAPPA_*.md
+GUI_*.md
+IMPLEMENTATION_*.md
+COMPLETION_*.md
+FIXES_*.md
+WEBENGINE_*.md

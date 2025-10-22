@@ -24,25 +24,25 @@ class TimescaleWriter:
     - Automatic schema creation
     """
     
-    def __init__(self, host: str = 'localhost', port: int = 5432,
-                 database: str = 'trading', user: str = 'postgres',
+    def __init__(self, host: Optional[str] = None, port: Optional[int] = None,
+                 database: Optional[str] = None, user: Optional[str] = None,
                  password: Optional[str] = None, min_conn: int = 1, max_conn: int = 20):
         """
         Initialize TimescaleDB writer.
         
         Args:
-            host: Database host
-            port: Database port
-            database: Database name
-            user: Database user
+            host: Database host (default: localhost)
+            port: Database port (default: 5432)
+            database: Database name (default: trading)
+            user: Database user (default: postgres)
             password: Database password
             min_conn: Minimum connections in pool
             max_conn: Maximum connections in pool
         """
-        self.host = host
-        self.port = port
-        self.database = database
-        self.user = user
+        self.host = host or 'localhost'
+        self.port = port or 5432
+        self.database = database or 'trading'
+        self.user = user or 'postgres'
         self.password = password
         
         # Create connection pool
