@@ -23,14 +23,12 @@ class LiveStreamCoordinator:
         api_key: str,
         db_writer,
         message_bus: MessageBus,
-        ownership_callback: Optional[Callable] = None,
     ) -> None:
         self.symbols = symbols
         self.timeframe = timeframe
         self.api_key = api_key
         self.db_writer = db_writer
         self.message_bus = message_bus
-        self.ownership_callback = ownership_callback
 
         self._threads: List[threading.Thread] = []
         self._sources: Dict[str, LiveDataSource] = {}
@@ -71,11 +69,6 @@ class LiveStreamCoordinator:
         for thread in self._threads:
             thread.join(timeout=5)
 
-        if self.ownership_callback:
-            try:
-                self.ownership_callback(self.db_writer)
-            except Exception:
-                logger.debug("Writer release callback failed", exc_info=True)
         logger.info("Live streaming stopped")
 
     def _run_stream(self, symbol: str, source: LiveDataSource) -> None:

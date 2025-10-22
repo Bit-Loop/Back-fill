@@ -16,10 +16,12 @@ logger = logging.getLogger(__name__)
 
 
 def get_service() -> ScraperService:
-    if not hasattr(get_service, "_instance"):
+    service = getattr(get_service, "_instance", None)
+    if service is None:
         config = BackfillConfig.default()
-        get_service._instance = ScraperService(config=config)
-    return get_service._instance  # type: ignore[attr-defined]
+        service = ScraperService(config=config)
+        setattr(get_service, "_instance", service)
+    return service
 
 
 app = FastAPI(title="Backfill Scraper Service", version="1.0.0")

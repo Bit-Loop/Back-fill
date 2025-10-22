@@ -34,9 +34,15 @@ class ScraperService:
         self._job_futures: Dict[str, Future] = {}
         self._jobs_lock = threading.RLock()
 
+        api_key = self.config.polygon.api_key
+        if not api_key:
+            raise RuntimeError("POLYGON_API_KEY is required to run the scraper service")
+        self._api_key: str = api_key
+
         self._stream_lock = threading.RLock()
         self._stream_coordinator: Optional[LiveStreamCoordinator] = None
         self._stream_status = StreamStatus(active=False)
+        self._stream_writer: Optional[TimescaleWriter] = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -94,13 +100,13 @@ class ScraperService:
             coordinator = LiveStreamCoordinator(
                 symbols=request.tickers,
                 timeframe=request.timeframe,
-                api_key=self.config.polygon.api_key,
+                api_key=self._api_key,
                 db_writer=db_writer,
                 message_bus=self._create_message_bus(),
-                ownership_callback=self._release_writer
             )
             coordinator.start()
             self._stream_coordinator = coordinator
+            self._stream_writer = db_writer
             self._stream_status = StreamStatus(
                 active=True,
                 tickers=request.tickers,
@@ -119,6 +125,9 @@ class ScraperService:
 
             self._stream_coordinator.stop()
             self._stream_coordinator = None
+            if self._stream_writer:
+                self._release_writer(self._stream_writer)
+                self._stream_writer = None
             self._stream_status = StreamStatus(active=False)
             logger.info("Streaming stopped")
             return self._stream_status
@@ -145,7 +154,7 @@ class ScraperService:
         try:
             writer = self._create_writer()
             orchestrator = BackfillOrchestrator(
-                polygon_api_key=self.config.polygon.api_key,
+                polygon_api_key=self._api_key,
                 db_writer=writer,
                 years_back=status.request.years,
                 use_flatfiles=status.request.use_flatfiles,
