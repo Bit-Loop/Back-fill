@@ -3,11 +3,106 @@ import os
 import tempfile
 from contextlib import contextmanager
 from datetime import datetime
-from typing import Generator
+from typing import Generator, List, Dict, Any
 
 import pytest
 
 
+# Mock classes (importable for direct instantiation in tests)
+class MockKafkaProducer:
+    """Mock Kafka producer for testing envelope publishing."""
+    
+    def __init__(self):
+        self.messages: List[Dict[str, Any]] = []
+    
+    async def send(self, topic: str, value: bytes, key: bytes = None):
+        self.messages.append({
+            'topic': topic,
+            'value': value,
+            'key': key,
+            'timestamp': datetime.utcnow()
+        })
+    
+    async def flush(self):
+        pass
+    
+    async def close(self):
+        pass
+
+
+class MockRedisClient:
+    """Mock Redis client for testing pub/sub mirroring."""
+    
+    def __init__(self):
+        self.published: List[Dict[str, Any]] = []
+    
+    async def publish(self, channel: str, message: str):
+        self.published.append({
+            'channel': channel,
+            'message': message,
+            'timestamp': datetime.utcnow()
+        })
+    
+    async def close(self):
+        pass
+
+
+class MockPolygonClient:
+    """Mock Polygon API client for testing API backfill."""
+    
+    def __init__(self):
+        self.api_calls: List[Dict[str, Any]] = []
+    
+    async def get_aggregates(
+        self,
+        symbol: str,
+        timeframe: str,
+        start: datetime,
+        end: datetime
+    ) -> List[Dict[str, Any]]:
+        """Mock aggregates endpoint."""
+        self.api_calls.append({
+            "method": "get_aggregates",
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "start": start,
+            "end": end,
+            "timestamp": datetime.utcnow()
+        })
+        
+        # Return mock OHLCV data
+        return [
+            {
+                "t": int(start.timestamp() * 1000),
+                "o": 100.0,
+                "h": 101.0,
+                "l": 99.0,
+                "c": 100.5,
+                "v": 10000
+            }
+        ]
+    
+    async def get_snapshot(self, symbol: str) -> Dict[str, Any]:
+        """Mock snapshot endpoint."""
+        self.api_calls.append({
+            "method": "get_snapshot",
+            "symbol": symbol,
+            "timestamp": datetime.utcnow()
+        })
+        
+        return {
+            "ticker": symbol,
+            "day": {
+                "o": 100.0,
+                "h": 105.0,
+                "l": 98.0,
+                "c": 102.0,
+                "v": 1000000
+            }
+        }
+
+
+# Fixtures
 @pytest.fixture
 def temp_db():
     """Provide temporary SQLite database for testing."""
@@ -19,47 +114,13 @@ def temp_db():
 
 @pytest.fixture
 def mock_kafka_producer():
-    """Mock Kafka producer for testing."""
-    
-    class MockKafkaProducer:
-        def __init__(self):
-            self.messages = []
-        
-        async def send(self, topic: str, value: bytes, key: bytes = None):
-            self.messages.append({
-                'topic': topic,
-                'value': value,
-                'key': key,
-                'timestamp': datetime.utcnow()
-            })
-        
-        async def flush(self):
-            pass
-        
-        async def close(self):
-            pass
-    
+    """Mock Kafka producer fixture."""
     return MockKafkaProducer()
 
 
 @pytest.fixture
 def mock_redis_client():
-    """Mock Redis client for testing."""
-    
-    class MockRedisClient:
-        def __init__(self):
-            self.published = []
-        
-        async def publish(self, channel: str, message: str):
-            self.published.append({
-                'channel': channel,
-                'message': message,
-                'timestamp': datetime.utcnow()
-            })
-        
-        async def close(self):
-            pass
-    
+    """Mock Redis client fixture."""
     return MockRedisClient()
 
 

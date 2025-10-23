@@ -21,8 +21,9 @@ class UnifiedOrchestrator:
     Production-grade orchestrator for ChronoX ingestion.
     
     Manages lifecycle of symbol ingestion strategies with:
-    - Sequential execution per symbol (flatpack→snapshot→stream)
-    - Kafka-first, DB-consumer model
+    - Hybrid strategies (flatpack+api+snapshot+stream)
+    - Gap detection and API backfill
+    - Kafka-first or DB-first publishing
     - Structured logging with elapsed time, record counts
     - Error recovery and status management
     """
@@ -34,7 +35,11 @@ class UnifiedOrchestrator:
         registry_manager: RegistryManager,
         kafka_producer: Optional[Any] = None,
         redis_client: Optional[Any] = None,
-        dry_run: bool = False
+        dry_run: bool = False,
+        publish_mode: str = "kafka-first",
+        throttle_ms: int = 0,
+        snapshot_method: str = "snapshot",
+        enable_stream: bool = True
     ):
         """
         Initialize orchestrator.
@@ -46,6 +51,10 @@ class UnifiedOrchestrator:
             kafka_producer: Optional Kafka producer
             redis_client: Optional Redis client
             dry_run: If True, simulate without writes
+            publish_mode: "kafka-first" or "db-first"
+            throttle_ms: Milliseconds to wait between publishes
+            snapshot_method: "rest", "agg", or "snapshot"
+            enable_stream: If False, skip stream phase
         """
         self.polygon_client = PolygonClient(polygon_api_key)
         self.db_writer = db_writer
@@ -53,9 +62,17 @@ class UnifiedOrchestrator:
         self.kafka_producer = kafka_producer
         self.redis_client = redis_client
         self.dry_run = dry_run
+        self.publish_mode = publish_mode
+        self.throttle_ms = throttle_ms
+        self.snapshot_method = snapshot_method
+        self.enable_stream = enable_stream
         self._running = False
         
-        logger.info("unified_orchestrator_initialized", dry_run=dry_run)
+        logger.info("unified_orchestrator_initialized", 
+                   dry_run=dry_run, 
+                   publish_mode=publish_mode,
+                   snapshot_method=snapshot_method,
+                   enable_stream=enable_stream)
     
     @asynccontextmanager
     async def lifecycle(self) -> AsyncIterator[None]:
@@ -118,7 +135,9 @@ class UnifiedOrchestrator:
     
     async def _execute_symbol(self, entry: SymbolRegistry) -> Dict[str, Any]:
         """
-        Execute ingestion strategy for single symbol.
+        Execute ingestion strategy for single symbol with hybrid support.
+        
+        Executes phases in order: flatpack → api → snapshot → stream
         
         Args:
             entry: Symbol registry entry
@@ -128,11 +147,12 @@ class UnifiedOrchestrator:
         """
         symbol = entry.symbol
         strategy = entry.strategy
+        timeframe = entry.timeframe
         
         start_time = time.time()
         
         if hasattr(logger, 'bind'):
-            log = logger.bind(symbol=symbol, strategy=strategy.value)
+            log = logger.bind(symbol=symbol, strategy=strategy.value, timeframe=timeframe)
         else:
             log = logger
         
@@ -140,7 +160,7 @@ class UnifiedOrchestrator:
             if hasattr(logger, 'bind'):
                 log.info("symbol_execution_started")
             else:
-                log.info(f"symbol_execution_started: {symbol} strategy={strategy.value}")
+                log.info(f"symbol_execution_started: {symbol} strategy={strategy.value} timeframe={timeframe}")
         
         try:
             self.registry_manager.update_status(symbol, IngestionStatus.RUNNING)
@@ -148,28 +168,46 @@ class UnifiedOrchestrator:
             result = {
                 'symbol': symbol,
                 'strategy': strategy.value,
+                'timeframe': timeframe,
                 'phases': {},
                 'elapsed': 0,
                 'status': 'success'
             }
             
-            if strategy in {IngestionStrategy.FLATPACK, IngestionStrategy.FLATPACK_API,
-                          IngestionStrategy.FLATPACK_SNAPSHOT_STREAM}:
-                phase_result = await self._execute_flatpack_phase(symbol, log)
+            # Parse strategy to determine phases
+            strategy_str = strategy.value
+            phases = strategy_str.split('+')
+            
+            # Phase 1: Flatpack (historical bulk backfill)
+            if 'flatpack' in phases:
+                phase_result = await self._execute_flatpack_phase(symbol, timeframe, log)
                 result['phases']['flatpack'] = phase_result
                 self.registry_manager.update_timestamp(symbol, backfill=True)
             
-            if strategy in {IngestionStrategy.SNAPSHOT, IngestionStrategy.SNAPSHOT_STREAM,
-                          IngestionStrategy.FLATPACK_SNAPSHOT_STREAM}:
-                phase_result = await self._execute_snapshot_phase(symbol, log)
+            # Phase 2: API (gap filling after flatpack)
+            if 'api' in phases:
+                # Detect gaps and fill with API
+                gaps = await self._detect_gaps(symbol, timeframe, entry.last_backfill)
+                if gaps:
+                    phase_result = await self._execute_api_phase(symbol, timeframe, gaps, log)
+                    result['phases']['api'] = phase_result
+                    self.registry_manager.update_timestamp(symbol, backfill=True)
+                else:
+                    result['phases']['api'] = {'status': 'skipped', 'reason': 'no_gaps'}
+            
+            # Phase 3: Snapshot (current baseline)
+            if 'snapshot' in phases:
+                phase_result = await self._execute_snapshot_phase(symbol, timeframe, log)
                 result['phases']['snapshot'] = phase_result
                 self.registry_manager.update_timestamp(symbol, snapshot=True)
             
-            if strategy in {IngestionStrategy.STREAM, IngestionStrategy.SNAPSHOT_STREAM,
-                          IngestionStrategy.FLATPACK_SNAPSHOT_STREAM}:
-                phase_result = await self._execute_stream_phase(symbol, log)
+            # Phase 4: Stream (live updates)
+            if 'stream' in phases and self.enable_stream:
+                phase_result = await self._execute_stream_phase(symbol, timeframe, log)
                 result['phases']['stream'] = phase_result
                 self.registry_manager.update_timestamp(symbol, stream=True)
+            elif 'stream' in phases and not self.enable_stream:
+                result['phases']['stream'] = {'status': 'skipped', 'reason': 'disabled_by_flag'}
             
             elapsed = time.time() - start_time
             result['elapsed'] = round(elapsed, 2)
@@ -180,7 +218,8 @@ class UnifiedOrchestrator:
                 "symbol_execution_completed",
                 elapsed=result['elapsed'],
                 kafka=self.kafka_producer is not None,
-                redis=self.redis_client is not None
+                redis=self.redis_client is not None,
+                publish_mode=self.publish_mode
             )
             
             return result
@@ -200,72 +239,214 @@ class UnifiedOrchestrator:
             return {
                 'symbol': symbol,
                 'strategy': strategy.value,
+                'timeframe': timeframe,
                 'status': 'error',
                 'error': error_msg,
                 'elapsed': round(elapsed, 2)
             }
     
-    async def _execute_flatpack_phase(self, symbol: str, log: Any) -> Dict[str, Any]:
-        """Execute flatpack phase."""
-        log.info("phase_flatpack_started")
+    async def _detect_gaps(self, symbol: str, timeframe: str, last_backfill: Optional[datetime]) -> List[Dict[str, Any]]:
+        """
+        Detect gaps in data coverage for API backfill.
         
+        Args:
+            symbol: Symbol ticker
+            timeframe: Timeframe (e.g., "1m")
+            last_backfill: Last backfill timestamp from registry
+        
+        Returns:
+            List of gap windows [{start, end, duration_minutes}]
+        """
+        if not last_backfill:
+            return []
+        
+        now = datetime.utcnow()
+        gap_threshold = timedelta(minutes=5)
+        
+        if now - last_backfill > gap_threshold:
+            gap = {
+                'start': last_backfill,
+                'end': now,
+                'duration_minutes': round((now - last_backfill).total_seconds() / 60, 2)
+            }
+            logger.info("gap_detected", symbol=symbol, **gap)
+            return [gap]
+        
+        return []
+    
+    async def _execute_flatpack_phase(self, symbol: str, timeframe: str, log: Any) -> Dict[str, Any]:
+        """Execute flatpack bulk historical backfill."""
+        log.info("phase_flatpack_started", timeframe=timeframe)
+        
+        # Simulate flatpack ingestion
         if self.dry_run:
             await asyncio.sleep(0.1)
             records = 1000
+            from_ts = (datetime.utcnow() - timedelta(days=365)).isoformat()
+            to_ts = (datetime.utcnow() - timedelta(days=1)).isoformat()
         else:
+            # TODO: Call actual flatpack client
             records = 0
+            from_ts = to_ts = None
         
-        if self.kafka_producer:
-            await self._publish_kafka(symbol, 'backfill', {'records': records})
+        # Publish with standard envelope
+        if records > 0:
+            await self._publish_envelope(
+                symbol=symbol,
+                timeframe=timeframe,
+                source="flatpack",
+                ohlcv={'o': 100, 'h': 105, 'l': 99, 'c': 103, 'v': 1000000},
+                ts=to_ts
+            )
         
-        log.info("phase_flatpack_completed", records=records)
-        return {'records': records, 'status': 'completed'}
+        log.info("phase_flatpack_completed", records=records, from_ts=from_ts, to_ts=to_ts)
+        return {'records': records, 'status': 'completed', 'from_ts': from_ts, 'to_ts': to_ts}
     
-    async def _execute_snapshot_phase(self, symbol: str, log: Any) -> Dict[str, Any]:
-        """Execute snapshot phase."""
-        log.info("phase_snapshot_started")
+    async def _execute_api_phase(self, symbol: str, timeframe: str, gaps: List[Dict], log: Any) -> Dict[str, Any]:
+        """Execute API backfill to fill detected gaps."""
+        log.info("phase_api_started", timeframe=timeframe, gaps=len(gaps))
+        
+        total_records = 0
+        for gap in gaps:
+            log.info("filling_gap", from_ts=gap['start'].isoformat(), to_ts=gap['end'].isoformat())
+            
+            if self.dry_run:
+                await asyncio.sleep(0.05)
+                gap_records = 100
+            else:
+                # TODO: Call aggregates API for gap window
+                gap_records = 0
+            
+            total_records += gap_records
+            
+            # Throttle if requested
+            if self.throttle_ms > 0:
+                await asyncio.sleep(self.throttle_ms / 1000.0)
+        
+        log.info("phase_api_completed", records=total_records, gaps_filled=len(gaps))
+        return {'records': total_records, 'status': 'completed', 'gaps_filled': len(gaps)}
+    
+    async def _execute_snapshot_phase(self, symbol: str, timeframe: str, log: Any) -> Dict[str, Any]:
+        """Execute snapshot fetch for current baseline."""
+        log.info("phase_snapshot_started", timeframe=timeframe, method=self.snapshot_method)
         
         if self.dry_run:
             await asyncio.sleep(0.1)
             records = 1
+            snapshot_ts = datetime.utcnow().isoformat()
         else:
+            # TODO: Call snapshot client based on self.snapshot_method
             records = 0
+            snapshot_ts = None
         
-        if self.kafka_producer:
-            await self._publish_kafka(symbol, 'snapshot', {'records': records})
+        # Publish snapshot with standard envelope
+        if records > 0:
+            await self._publish_envelope(
+                symbol=symbol,
+                timeframe=timeframe,
+                source="snapshot",
+                ohlcv={'o': 103, 'h': 104, 'l': 102, 'c': 103.5, 'v': 5000},
+                ts=snapshot_ts
+            )
         
-        log.info("phase_snapshot_completed", records=records)
-        return {'records': records, 'status': 'completed'}
+        log.info("phase_snapshot_completed", records=records, ts=snapshot_ts)
+        return {'records': records, 'status': 'completed', 'ts': snapshot_ts}
     
-    async def _execute_stream_phase(self, symbol: str, log: Any) -> Dict[str, Any]:
-        """Execute stream phase."""
-        log.info("phase_stream_started")
+    async def _execute_stream_phase(self, symbol: str, timeframe: str, log: Any) -> Dict[str, Any]:
+        """Activate live streaming for symbol."""
+        log.info("phase_stream_started", timeframe=timeframe)
         
-        if self.kafka_producer:
-            await self._publish_kafka(symbol, 'stream', {'action': 'activate'})
+        # TODO: Activate WebSocket stream
         
         log.info("phase_stream_activated")
-        return {'status': 'activated'}
+        return {'status': 'activated', 'timeframe': timeframe}
     
-    async def _publish_kafka(self, symbol: str, phase: str, data: Dict) -> None:
-        """Publish event to Kafka."""
-        if not self.kafka_producer or self.dry_run:
-            return
+    async def _publish_envelope(
+        self, 
+        symbol: str, 
+        timeframe: str, 
+        source: str,
+        ohlcv: Dict,
+        ts: Optional[str] = None,
+        features: Optional[Dict] = None
+    ) -> None:
+        """
+        Publish standard envelope to Kafka and optionally Redis.
         
-        import json
-        
-        topic = f'chronox.{phase}.{symbol.lower()}'
-        payload = {
-            'symbol': symbol,
-            'phase': phase,
-            'timestamp': datetime.utcnow().isoformat(),
-            **data
+        Standard envelope format:
+        {
+          "event": "bar",
+          "symbol": "AAPL",
+          "tf": "1m",
+          "ts": "2025-10-22T18:52:47Z",
+          "ohlcv": {"o":100, "h":105, "l":99, "c":103, "v":1000000},
+          "features": {"sma20":..., "ema50":..., "rsi14":...},
+          "source": "flatpack|api|snapshot|stream",
+          "version": "v1",
+          "dedup_key": "AAPL|1m|2025-10-22T18:52:00Z"
         }
         
-        message = json.dumps(payload).encode('utf-8')
-        key = symbol.encode('utf-8')
+        Args:
+            symbol: Symbol ticker
+            timeframe: Timeframe (e.g., "1m")
+            source: Data source (flatpack, api, snapshot, stream)
+            ohlcv: OHLCV dict with o,h,l,c,v keys
+            ts: ISO8601 timestamp (defaults to now)
+            features: Optional technical indicators
+        """
+        if self.dry_run:
+            return
         
-        await self.kafka_producer.send(topic, message, key)
+        if ts is None:
+            ts = datetime.utcnow().isoformat() + 'Z'
+        
+        # Build standard envelope
+        envelope = {
+            "event": "bar",
+            "symbol": symbol,
+            "tf": timeframe,
+            "ts": ts,
+            "ohlcv": ohlcv,
+            "features": features or {},
+            "source": source,
+            "version": "v1",
+            "dedup_key": f"{symbol}|{timeframe}|{ts}"
+        }
+        
+        message_bytes = json.dumps(envelope).encode('utf-8')
+        key_bytes = symbol.encode('utf-8')
+        
+        # Publish based on mode
+        if self.publish_mode == "kafka-first":
+            # Publish to Kafka first
+            if self.kafka_producer:
+                topic = f'chronox.bars.v1'
+                await self.kafka_producer.send(topic, message_bytes, key_bytes)
+                logger.debug("envelope_published_kafka", symbol=symbol, source=source)
+            
+            # Mirror to Redis for GUI (throttled)
+            if self.redis_client and source != "flatpack":  # Skip bulk backfill for Redis
+                channel = f"bars:{symbol}:{timeframe}"
+                await self.redis_client.publish(channel, message_bytes)
+                logger.debug("envelope_published_redis", symbol=symbol, channel=channel)
+        
+        elif self.publish_mode == "db-first":
+            # Write to DB first
+            # TODO: Implement DB write here
+            
+            # Then publish to Kafka
+            if self.kafka_producer:
+                topic = f'chronox.bars.v1'
+                await self.kafka_producer.send(topic, message_bytes, key_bytes)
+            
+            # Mirror to Redis
+            if self.redis_client and source != "flatpack":
+                channel = f"bars:{symbol}:{timeframe}"
+                await self.redis_client.publish(channel, message_bytes)
+        
+        # Apply throttle if configured
+        if self.throttle_ms > 0:
+            await asyncio.sleep(self.throttle_ms / 1000.0)
     
     async def resume_failed_jobs(self) -> int:
         """

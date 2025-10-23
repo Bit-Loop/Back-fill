@@ -16,6 +16,8 @@ class IngestionStrategy(str, Enum):
     FLATPACK_API = "flatpack+api"
     SNAPSHOT_STREAM = "snapshot+stream"
     FLATPACK_SNAPSHOT_STREAM = "flatpack+snapshot+stream"
+    FLATPACK_API_SNAPSHOT_STREAM = "flatpack+api+snapshot+stream"
+    API = "api"  # API-only backfill for gap filling
 
 
 class IngestionStatus(str, Enum):

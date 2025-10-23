@@ -15,7 +15,7 @@ import os
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 from common.storage.timescale_writer import TimescaleWriter
 from scraper.registry.manager import RegistryManager
@@ -114,6 +114,55 @@ Examples:
         help='Polygon.io API key (default: $POLYGON_API_KEY)'
     )
     
+    # Phase 2: New flags
+    parser.add_argument(
+        '--strategy',
+        type=str,
+        help='Override registry strategy (e.g., flatpack+api, snapshot+stream, flatpack+api+snapshot+stream)'
+    )
+    
+    parser.add_argument(
+        '--snapshot-method',
+        type=str,
+        choices=['rest', 'agg', 'snapshot'],
+        default='snapshot',
+        help='Snapshot fetch method (default: snapshot)'
+    )
+    
+    parser.add_argument(
+        '--publish-mode',
+        type=str,
+        choices=['kafka-first', 'db-first'],
+        default='kafka-first',
+        help='Publishing order: kafka-first (default) or db-first'
+    )
+    
+    parser.add_argument(
+        '--no-stream',
+        action='store_true',
+        help='Disable stream phase (run history + snapshot only)'
+    )
+    
+    parser.add_argument(
+        '--symbols',
+        type=str,
+        help='Comma-separated symbol list (overrides registry, e.g., AAPL,NVDA,AMD)'
+    )
+    
+    parser.add_argument(
+        '--timeframe',
+        type=str,
+        default='1m',
+        help='Override timeframe (default: 1m)'
+    )
+    
+    parser.add_argument(
+        '--throttle-ms',
+        type=int,
+        default=0,
+        help='Throttle publish rate in milliseconds (default: 0 = no throttle)'
+    )
+    
     return parser.parse_args()
 
 
@@ -190,29 +239,64 @@ async def run_one_cycle(
     db_writer: TimescaleWriter,
     registry_manager: RegistryManager,
     dry_run: bool,
+    publish_mode: str,
+    throttle_ms: int,
+    snapshot_method: str,
+    enable_stream: bool,
+    symbol_override: Optional[List[str]],
+    strategy_override: Optional[str],
+    timeframe_override: str,
     logger: Any
 ) -> None:
     """
-    Execute one orchestration cycle.
+    Execute one orchestration cycle with flag overrides.
     
     Args:
         polygon_api_key: Polygon API key
         db_writer: Database writer
         registry_manager: Registry manager
         dry_run: If True, simulate without writes
+        publish_mode: "kafka-first" or "db-first"
+        throttle_ms: Throttle milliseconds
+        snapshot_method: Snapshot method
+        enable_stream: Enable stream phase
+        symbol_override: Override symbols from CLI
+        strategy_override: Override strategy from CLI
+        timeframe_override: Override timeframe
         logger: Logger instance
     """
     orchestrator = UnifiedOrchestrator(
         polygon_api_key=polygon_api_key,
         db_writer=db_writer,
         registry_manager=registry_manager,
-        dry_run=dry_run
+        dry_run=dry_run,
+        publish_mode=publish_mode,
+        throttle_ms=throttle_ms,
+        snapshot_method=snapshot_method,
+        enable_stream=enable_stream
     )
     
     await orchestrator.resume_failed_jobs()
     
     async with orchestrator.lifecycle():
-        results = await orchestrator.run_cycle()
+        # If symbol override, filter registry to just those symbols
+        if symbol_override:
+            filtered_symbols = []
+            for sym in symbol_override:
+                entry = registry_manager.get_symbol(sym)
+                if entry and entry.enabled:
+                    filtered_symbols.append(entry)
+                else:
+                    logger.warn("symbol_not_found_or_disabled", symbol=sym)
+            
+            # Execute only filtered symbols
+            results = {}
+            for entry in filtered_symbols:
+                result = await orchestrator._execute_symbol(entry)
+                results[entry.symbol] = result
+        else:
+            # Execute all enabled symbols from registry
+            results = await orchestrator.run_cycle()
         
         success_count = sum(1 for r in results.values() if r.get('status') == 'success')
         error_count = sum(1 for r in results.values() if r.get('status') == 'error')
@@ -221,7 +305,8 @@ async def run_one_cycle(
             "cycle_completed",
             total=len(results),
             success=success_count,
-            errors=error_count
+            errors=error_count,
+            symbol_override=symbol_override is not None
         )
 
 
@@ -330,11 +415,40 @@ async def main() -> int:
         )
         return 0
     
+    # Handle symbol/strategy overrides
+    symbol_override = None
+    if args.symbols:
+        symbol_override = [s.strip().upper() for s in args.symbols.split(',')]
+        logger.info("symbol_override_active", symbols=symbol_override)
+    
+    # If symbol override with strategy override, temporarily inject into registry
+    if symbol_override and args.strategy:
+        from scraper.registry.models import IngestionStrategy
+        for sym in symbol_override:
+            try:
+                # Add or update symbol in registry with override strategy
+                registry_manager.add_symbol(
+                    symbol=sym,
+                    strategy=IngestionStrategy(args.strategy),
+                    timeframe=args.timeframe,
+                    enabled=True
+                )
+                logger.info("symbol_added_for_override", symbol=sym, strategy=args.strategy)
+            except Exception as e:
+                logger.warn("symbol_override_failed", symbol=sym, error=str(e))
+    
     await run_one_cycle(
         polygon_api_key=args.polygon_api_key,
         db_writer=db_writer,
         registry_manager=registry_manager,
         dry_run=args.dry_run,
+        publish_mode=args.publish_mode,
+        throttle_ms=args.throttle_ms,
+        snapshot_method=args.snapshot_method,
+        enable_stream=not args.no_stream,
+        symbol_override=symbol_override,
+        strategy_override=args.strategy,
+        timeframe_override=args.timeframe,
         logger=logger
     )
     
