@@ -16,8 +16,8 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
-from common.storage.timescale_writer import TimescaleWriter
-from scraper.orchestrator import BackfillOrchestrator
+from storage.timescale.writer import TimescaleWriter
+from core.orchestrator.legacy import BackfillOrchestrator
 from scraper.registry.manager import RegistryManager
 from scraper.registry.models import IngestionStrategy
 

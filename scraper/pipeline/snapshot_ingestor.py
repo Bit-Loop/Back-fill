@@ -5,7 +5,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Dict, Iterable, List, Optional
 
-from common.storage.timescale_writer import TimescaleWriter
+from storage.timescale.writer import TimescaleWriter
 from scraper.clients.snapshot_client import SnapshotClient
 
 logger = logging.getLogger(__name__)

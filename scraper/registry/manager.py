@@ -5,7 +5,7 @@ import logging
 from datetime import datetime
 from typing import List, Optional
 
-from common.storage.timescale_writer import TimescaleWriter
+from storage.timescale.writer import TimescaleWriter
 
 from .models import IngestionStatus, IngestionStrategy, SymbolRegistry
 
