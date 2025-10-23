@@ -3,10 +3,10 @@ TimescaleDB Writer
 Handles writing market data to TimescaleDB (PostgreSQL + TimescaleDB extension).
 """
 import psycopg2
-from psycopg2 import pool, extras
+from psycopg2 import pool, extras, sql
 import logging
 from typing import List, Dict, Optional, Any
-from datetime import datetime
+from datetime import datetime, timezone
 from contextlib import contextmanager
 
 logger = logging.getLogger(__name__)
@@ -95,6 +95,64 @@ class TimescaleWriter:
             # Create OHLCV tables for different timeframes
             timeframes = ['1m', '5m', '15m', '30m', '1h', '2h', '4h', '12h', '1d', '1w', '1mo']
             
+            def ensure_symbol_column(table_name: str) -> None:
+                cur.execute(
+                    """
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_schema = current_schema()
+                      AND table_name = %s
+                      AND column_name = 'symbol'
+                    """,
+                    (table_name,),
+                )
+                if cur.fetchone():
+                    return
+
+                cur.execute(
+                    """
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_schema = current_schema()
+                      AND table_name = %s
+                      AND column_name = 'ticker'
+                    """,
+                    (table_name,),
+                )
+                if cur.fetchone():
+                    logger.info("Renaming legacy ticker column to symbol on %s", table_name)
+                    cur.execute(
+                        sql.SQL("ALTER TABLE {} RENAME COLUMN ticker TO symbol").format(
+                            sql.Identifier(table_name)
+                        )
+                    )
+                else:
+                    logger.info("Adding missing symbol column to %s", table_name)
+                    cur.execute(
+                        sql.SQL("ALTER TABLE {} ADD COLUMN symbol TEXT").format(
+                            sql.Identifier(table_name)
+                        )
+                    )
+            
+            def ensure_transactions_column(table_name: str) -> None:
+                cur.execute(
+                    """
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_schema = current_schema()
+                      AND table_name = %s
+                      AND column_name = 'transactions'
+                    """,
+                    (table_name,),
+                )
+                if not cur.fetchone():
+                    logger.info("Adding missing transactions column to %s", table_name)
+                    cur.execute(
+                        sql.SQL("ALTER TABLE {} ADD COLUMN transactions INTEGER").format(
+                            sql.Identifier(table_name)
+                        )
+                    )
+
             for tf in timeframes:
                 table_name = f'market_data_{tf}'
                 
@@ -114,6 +172,9 @@ class TimescaleWriter:
                     );
                 """)
                 
+                ensure_symbol_column(table_name)
+                ensure_transactions_column(table_name)
+
                 # Convert to hypertable
                 cur.execute(f"""
                     SELECT create_hypertable('{table_name}', 'time', 
@@ -173,6 +234,58 @@ class TimescaleWriter:
                 );
             """)
             
+            # Ensure symbol column exists (migrate legacy ticker column if present)
+            ensure_symbol_column('corporate_actions')
+            
+            # Ensure all date columns exist in corporate_actions
+            for col in ['ex_dividend_date', 'record_date', 'pay_date', 'declaration_date']:
+                cur.execute(
+                    """
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_schema = current_schema()
+                      AND table_name = 'corporate_actions'
+                      AND column_name = %s
+                    """,
+                    (col,),
+                )
+                if not cur.fetchone():
+                    logger.info(f"Adding missing {col} column to corporate_actions")
+                    cur.execute(
+                        sql.SQL("ALTER TABLE corporate_actions ADD COLUMN {} DATE").format(
+                            sql.Identifier(col)
+                        )
+                    )
+            
+            # Ensure numeric columns exist
+            numeric_cols = {
+                'cash_amount': 'DOUBLE PRECISION',
+                'split_from': 'INTEGER',
+                'split_to': 'INTEGER'
+            }
+            for col, col_type in numeric_cols.items():
+                cur.execute(
+                    """
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_schema = current_schema()
+                      AND table_name = 'corporate_actions'
+                      AND column_name = %s
+                    """,
+                    (col,),
+                )
+                if not cur.fetchone():
+                    logger.info(f"Adding missing {col} column to corporate_actions")
+                    cur.execute(
+                        sql.SQL("ALTER TABLE corporate_actions ADD COLUMN {} {}").format(
+                            sql.Identifier(col),
+                            sql.SQL(col_type)
+                        )
+                    )
+            
+            # Commit the schema changes before creating indexes
+            conn.commit()
+            
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_corporate_actions_symbol 
                 ON corporate_actions (symbol, execution_date);
@@ -201,6 +314,38 @@ class TimescaleWriter:
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_news_tickers 
                 ON news_articles USING GIN (tickers);
+            """)
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS market_snapshots (
+                    symbol TEXT NOT NULL,
+                    updated_at TIMESTAMPTZ NOT NULL,
+                    last_trade_price DOUBLE PRECISION,
+                    last_trade_size BIGINT,
+                    last_trade_exchange TEXT,
+                    last_quote_bid DOUBLE PRECISION,
+                    last_quote_ask DOUBLE PRECISION,
+                    last_quote_bid_size BIGINT,
+                    last_quote_ask_size BIGINT,
+                    day_open DOUBLE PRECISION,
+                    day_high DOUBLE PRECISION,
+                    day_low DOUBLE PRECISION,
+                    day_close DOUBLE PRECISION,
+                    day_volume BIGINT,
+                    prev_close DOUBLE PRECISION,
+                    prev_volume BIGINT,
+                    todays_change DOUBLE PRECISION,
+                    todays_change_percent DOUBLE PRECISION,
+                    minute_vwap DOUBLE PRECISION,
+                    minute_volume BIGINT,
+                    raw_data JSONB,
+                    PRIMARY KEY (symbol, updated_at)
+                );
+            """)
+
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_market_snapshots_updated
+                ON market_snapshots (updated_at DESC);
             """)
             
             conn.commit()
@@ -437,6 +582,100 @@ class TimescaleWriter:
             
             conn.commit()
             logger.debug(f"Wrote {len(data)} news articles")
+            return len(data)
+
+    def write_snapshots(self, snapshots: List[Dict]) -> int:
+        """
+        Write snapshot payloads to database.
+        """
+        if not snapshots:
+            return 0
+
+        with self.get_connection() as conn:
+            cur = conn.cursor()
+
+            data = []
+            for snapshot in snapshots:
+                updated = snapshot.get('updated_at')
+                if isinstance(updated, datetime):
+                    updated_at = updated if updated.tzinfo else updated.replace(tzinfo=timezone.utc)
+                else:
+                    numeric_ts: Optional[float] = None
+                    if isinstance(updated, (int, float)):
+                        numeric_ts = float(updated)
+                    elif isinstance(updated, str):
+                        try:
+                            numeric_ts = float(updated)
+                        except ValueError:
+                            numeric_ts = None
+
+                    if numeric_ts is not None:
+                        updated_at = datetime.fromtimestamp(numeric_ts / 1000.0, tz=timezone.utc)
+                    else:
+                        updated_at = datetime.now(timezone.utc)
+
+                data.append((
+                    snapshot.get('symbol'),
+                    updated_at,
+                    snapshot.get('last_trade_price'),
+                    snapshot.get('last_trade_size'),
+                    snapshot.get('last_trade_exchange'),
+                    snapshot.get('last_quote_bid'),
+                    snapshot.get('last_quote_ask'),
+                    snapshot.get('last_quote_bid_size'),
+                    snapshot.get('last_quote_ask_size'),
+                    snapshot.get('day_open'),
+                    snapshot.get('day_high'),
+                    snapshot.get('day_low'),
+                    snapshot.get('day_close'),
+                    snapshot.get('day_volume'),
+                    snapshot.get('prev_close'),
+                    snapshot.get('prev_volume'),
+                    snapshot.get('todays_change'),
+                    snapshot.get('todays_change_percent'),
+                    snapshot.get('minute_vwap'),
+                    snapshot.get('minute_volume'),
+                    extras.Json(snapshot.get('raw'))
+                ))
+
+            extras.execute_batch(cur, """
+                INSERT INTO market_snapshots (
+                    symbol, updated_at, last_trade_price, last_trade_size, last_trade_exchange,
+                    last_quote_bid, last_quote_ask, last_quote_bid_size, last_quote_ask_size,
+                    day_open, day_high, day_low, day_close, day_volume,
+                    prev_close, prev_volume, todays_change, todays_change_percent,
+                    minute_vwap, minute_volume, raw_data
+                ) VALUES (
+                    %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s,
+                    %s, %s, %s
+                )
+                ON CONFLICT (symbol, updated_at) DO UPDATE SET
+                    last_trade_price = EXCLUDED.last_trade_price,
+                    last_trade_size = EXCLUDED.last_trade_size,
+                    last_trade_exchange = EXCLUDED.last_trade_exchange,
+                    last_quote_bid = EXCLUDED.last_quote_bid,
+                    last_quote_ask = EXCLUDED.last_quote_ask,
+                    last_quote_bid_size = EXCLUDED.last_quote_bid_size,
+                    last_quote_ask_size = EXCLUDED.last_quote_ask_size,
+                    day_open = EXCLUDED.day_open,
+                    day_high = EXCLUDED.day_high,
+                    day_low = EXCLUDED.day_low,
+                    day_close = EXCLUDED.day_close,
+                    day_volume = EXCLUDED.day_volume,
+                    prev_close = EXCLUDED.prev_close,
+                    prev_volume = EXCLUDED.prev_volume,
+                    todays_change = EXCLUDED.todays_change,
+                    todays_change_percent = EXCLUDED.todays_change_percent,
+                    minute_vwap = EXCLUDED.minute_vwap,
+                    minute_volume = EXCLUDED.minute_volume,
+                    raw_data = EXCLUDED.raw_data
+            """, data, page_size=500)
+
+            conn.commit()
+            logger.debug("Wrote %s market snapshots", len(data))
             return len(data)
     
     def close(self):

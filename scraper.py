@@ -19,10 +19,16 @@ from common.config.settings import BackfillConfig
 from scraper.clients.polygon_client import PolygonClient
 from scraper.clients.reference_client import ReferenceClient
 from scraper.service import ScraperService
-from scraper.service.models import BackfillRequest, JobState, StreamRequest
+from scraper.service.models import BackfillRequest, BackfillSource, JobState, StreamRequest
 
 # ---------------------------------------------------------------------------
 # Environment & logging configuration
+# All configuration loaded from .env file:
+#   - POLYGON_API_KEY: Polygon.io API key (required)
+#   - TIMESCALE_HOST/PORT/DB/USER/PASSWORD: Database connection
+#   - REDIS_HOST/PORT/PASSWORD: Redis connection for streaming
+#   - LOG_DIR: Directory for log files (default: ./logs)
+#   - LOG_LEVEL: Logging level (default: INFO)
 # ---------------------------------------------------------------------------
 load_dotenv()
 
@@ -53,6 +59,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, help="Limit number of tickers when using --all")
     parser.add_argument("--years", type=int, default=5, help="Years of historical data")
     parser.add_argument("--flatfiles", action="store_true", help="Use Polygon flat files when available")
+    parser.add_argument(
+        "--source",
+        type=str,
+        choices=["rest", "flatfile", "snapshot", "hybrid"],
+        default=os.getenv("SCRAPER_SOURCE", "rest"),
+        help="Backfill data source strategy",
+    )
+    parser.add_argument("--publish-kafka", action="store_true", help="Publish ingested data to Kafka")
+    parser.add_argument("--kafka-topic", type=str, default=os.getenv("KAFKA_TOPIC", "chronox.market.snapshots"), help="Kafka topic for publishing")
+    parser.add_argument("--kafka-brokers", type=str, default=os.getenv("KAFKA_BROKERS", ""), help="Kafka bootstrap servers")
+    parser.add_argument("--no-redis-publish", action="store_true", help="Disable Redis publication during backfill")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     parser.add_argument("--skip-reference", action="store_true", help="Skip reference data phase")
     parser.add_argument("--skip-corporate", action="store_true", help="Skip corporate actions phase")
@@ -173,6 +190,10 @@ def main() -> None:
             logger.error("Streaming requested but no tickers available")
             sys.exit(1)
 
+    source_choice = args.source
+    if args.flatfiles:
+        source_choice = "flatfile"
+
     service = ScraperService(config=config)
     job_id: Optional[str] = None
 
@@ -185,13 +206,18 @@ def main() -> None:
             request = BackfillRequest(
                 tickers=backfill_tickers,
                 years=args.years,
-                use_flatfiles=args.flatfiles,
+                use_flatfiles=args.flatfiles or source_choice == "flatfile",
                 debug=args.debug,
                 skip_reference=args.skip_reference,
                 skip_corporate=args.skip_corporate,
                 skip_daily=args.skip_daily,
                 skip_minute=args.skip_minute,
                 skip_news=args.skip_news,
+                source=BackfillSource(source_choice),
+                publish_kafka=args.publish_kafka,
+                publish_redis=not args.no_redis_publish,
+                kafka_topic=args.kafka_topic,
+                kafka_bootstrap=args.kafka_brokers or None,
             )
             status = service.start_backfill(request)
             job_id = status.job_id

@@ -5,6 +5,7 @@ from .data_sources import MarketDataSource, HistoricalDataSource, LiveDataSource
 from .message_bus import MessageBus, RedisMessageBus, KafkaToRedisBridge, InMemoryMessageBus
 from .ingestion_engine import DataIngestionEngine
 from .kafka_integration import KafkaProducer, KafkaConsumer, StreamProcessor
+from .snapshot_ingestor import SnapshotIngestor
 
 __all__ = [
     'MarketDataSource',
@@ -17,5 +18,6 @@ __all__ = [
     'DataIngestionEngine',
     'KafkaProducer',
     'KafkaConsumer',
-    'StreamProcessor'
+    'StreamProcessor',
+    'SnapshotIngestor'
 ]

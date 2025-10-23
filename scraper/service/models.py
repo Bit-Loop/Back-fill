@@ -17,6 +17,15 @@ class JobState(str, Enum):
     CANCELLED = "cancelled"
 
 
+class BackfillSource(str, Enum):
+    """Available strategies for sourcing historical market data."""
+
+    REST = "rest"
+    FLATFILE = "flatfile"
+    SNAPSHOT = "snapshot"
+    HYBRID = "hybrid"
+
+
 @dataclass
 class BackfillRequest:
     """Configuration payload for starting a backfill."""
@@ -30,6 +39,11 @@ class BackfillRequest:
     skip_daily: bool = False
     skip_minute: bool = False
     skip_news: bool = False
+    source: BackfillSource = BackfillSource.REST
+    publish_kafka: bool = False
+    publish_redis: bool = True
+    kafka_topic: str = "chronox.market.snapshots"
+    kafka_bootstrap: Optional[str] = None
 
 
 @dataclass

@@ -11,6 +11,7 @@ from typing import Dict, List, Optional
 from common.config.settings import BackfillConfig
 from common.storage import TimescaleWriter
 from scraper.orchestrator import BackfillOrchestrator
+from scraper.registry.manager import RegistryManager
 
 from .models import (
     BackfillRequest,
@@ -27,7 +28,13 @@ logger = logging.getLogger(__name__)
 class ScraperService:
     """High-level façade exposing backfill and streaming capabilities as a service."""
 
-    def __init__(self, config: Optional[BackfillConfig] = None, max_workers: int = 2) -> None:
+    def __init__(
+        self,
+        config: Optional[BackfillConfig] = None,
+        max_workers: int = 2,
+        enable_scheduler: bool = False,
+        snapshot_interval_minutes: int = 5,
+    ) -> None:
         self.config = config or BackfillConfig.default()
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
         self._jobs: Dict[str, JobStatus] = {}
@@ -43,10 +50,44 @@ class ScraperService:
         self._stream_coordinator: Optional[LiveStreamCoordinator] = None
         self._stream_status = StreamStatus(active=False)
         self._stream_writer: Optional[TimescaleWriter] = None
+        
+        # Scheduler support (optional) - only create once globally
+        self._scheduler = None
+        self._enable_scheduler = enable_scheduler
+        self._snapshot_interval_minutes = snapshot_interval_minutes
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+    def initialize_scheduler(self) -> None:
+        """Initialize scheduler if enabled and not already running."""
+        if not self._enable_scheduler or self._scheduler is not None:
+            return
+        
+        try:
+            from scraper.scheduler import IngestionScheduler
+            
+            writer = self._create_writer()
+            registry_manager = RegistryManager(writer)
+            orchestrator = BackfillOrchestrator(
+                polygon_api_key=self._api_key,
+                db_writer=writer,
+                years_back=5,
+                redis_config=self.config.redis,
+            )
+            
+            self._scheduler = IngestionScheduler(
+                orchestrator=orchestrator,
+                registry_manager=registry_manager,
+                snapshot_interval_minutes=self._snapshot_interval_minutes,
+            )
+            self._scheduler.start()
+            logger.info("Scheduler enabled with %d minute snapshot interval", self._snapshot_interval_minutes)
+        except ImportError as exc:
+            logger.warning("APScheduler not installed, scheduler disabled: %s", exc)
+        except Exception as exc:
+            logger.error("Failed to initialize scheduler: %s", exc)
+    
     def start_backfill(self, request: BackfillRequest) -> JobStatus:
         """Submit a backfill job to the executor."""
 
@@ -63,6 +104,42 @@ class ScraperService:
             self._job_futures[job_id] = future
 
         logger.info("Backfill job %s queued for tickers=%s", job_id, request.tickers)
+        return status
+    
+    def execute_registry(self, symbols: Optional[List[str]] = None) -> JobStatus:
+        """
+        Execute ingestion strategies from symbol registry.
+        
+        This is the registry-driven execution method that processes symbols
+        based on their configured strategies in the database.
+        
+        Args:
+            symbols: Optional list of symbols to process. If None, processes all enabled symbols.
+        
+        Returns:
+            JobStatus with job tracking information
+        """
+        job_id = str(uuid.uuid4())
+        # Create a synthetic request for registry execution
+        request = BackfillRequest(
+            tickers=symbols or [],
+            years=0,  # Not used in registry mode
+            use_flatfiles=False,
+            debug=False,
+        )
+        status = JobStatus(job_id=job_id, request=request, state=JobState.PENDING)
+        status.message = f"Registry execution for {len(symbols) if symbols else 'all enabled'} symbols"
+
+        with self._jobs_lock:
+            self._jobs[job_id] = status
+
+        future = self._executor.submit(self._run_registry_job, status, symbols)
+        future.add_done_callback(lambda fut, jid=job_id: self._finalize_job(jid, fut))
+
+        with self._jobs_lock:
+            self._job_futures[job_id] = future
+
+        logger.info("Registry execution job %s queued", job_id)
         return status
 
     def list_jobs(self) -> List[JobStatus]:
@@ -138,6 +215,8 @@ class ScraperService:
 
     def shutdown(self) -> None:
         logger.info("Shutting down scraper service")
+        if self._scheduler:
+            self._scheduler.stop()
         self.stop_stream()
         self._executor.shutdown(wait=False)
 
@@ -164,6 +243,12 @@ class ScraperService:
                 skip_daily=status.request.skip_daily,
                 skip_minute=status.request.skip_minute,
                 skip_news=status.request.skip_news,
+                source=status.request.source,
+                publish_kafka=status.request.publish_kafka,
+                publish_redis=status.request.publish_redis,
+                kafka_topic=status.request.kafka_topic,
+                kafka_bootstrap=status.request.kafka_bootstrap,
+                redis_config=self.config.redis,
             )
 
             result = orchestrator.run_full_backfill(status.request.tickers)
@@ -180,6 +265,41 @@ class ScraperService:
             status.error = str(exc)
             status.message = "Backfill failed"
             logger.exception("Backfill job %s failed", status.job_id)
+        finally:
+            if orchestrator:
+                orchestrator.close()
+            if writer:
+                writer.close()
+    
+    def _run_registry_job(self, status: JobStatus, symbols: Optional[List[str]]) -> None:
+        """Execute registry-based ingestion strategies."""
+        status.state = JobState.RUNNING
+        status.started_at = datetime.utcnow()
+        logger.info("Registry execution job %s started", status.job_id)
+
+        writer = None
+        orchestrator = None
+        try:
+            writer = self._create_writer()
+            orchestrator = BackfillOrchestrator(
+                polygon_api_key=self._api_key,
+                db_writer=writer,
+                years_back=5,  # Default for registry mode
+                redis_config=self.config.redis,
+            )
+
+            result = orchestrator.execute_registry_strategies(symbols=symbols)
+            status.state = JobState.COMPLETED
+            status.completed_at = datetime.utcnow()
+            status.result = result
+            status.message = f"Registry execution completed for {len(result)} symbols"
+            logger.info("Registry execution job %s completed: %s symbols", status.job_id, len(result))
+        except Exception as exc:
+            status.state = JobState.FAILED
+            status.completed_at = datetime.utcnow()
+            status.error = str(exc)
+            status.message = "Registry execution failed"
+            logger.exception("Registry execution job %s failed", status.job_id)
         finally:
             if orchestrator:
                 orchestrator.close()
@@ -220,6 +340,7 @@ class ScraperService:
             from scraper.pipeline import RedisMessageBus
 
             redis_cfg = self.config.redis
+            logger.debug("Attempting Redis connection at %s:%s", redis_cfg.host, redis_cfg.port)
             return RedisMessageBus(
                 host=redis_cfg.host,
                 port=redis_cfg.port,
@@ -227,7 +348,7 @@ class ScraperService:
                 password=redis_cfg.password,
             )
         except Exception as exc:  # pragma: no cover - fallback path
-            logger.warning("Falling back to in-memory message bus: %s", exc)
+            logger.warning("Redis unavailable, using in-memory message bus: %s", exc)
             from scraper.pipeline import InMemoryMessageBus
 
             return InMemoryMessageBus()

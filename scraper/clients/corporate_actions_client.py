@@ -79,11 +79,19 @@ class CorporateActionsClient:
         Returns:
             List of dividend dictionaries
         """
-        params = {}
+        endpoint = "/v3/reference/dividends"
+        params = {'ticker': ticker, 'limit': 1000}
+        
         if since:
             params['ex_dividend_date.gte'] = since
         
-        return self.get_dividends(ticker=ticker, **params)
+        try:
+            results = self.client._paginate(endpoint, params)
+            logger.debug(f"Fetched {len(results)} dividends for {ticker}")
+            return results
+        except Exception as e:
+            logger.error(f"Error fetching dividends for {ticker}: {e}")
+            return []
     
     def get_splits(self, ticker: Optional[str] = None, execution_date: Optional[str] = None,
                   limit: int = 1000) -> List[Dict]:
@@ -126,8 +134,17 @@ class CorporateActionsClient:
         Returns:
             List of split dictionaries
         """
-        params = {}
+        endpoint = "/v3/reference/splits"
+        params = {'ticker': ticker, 'limit': 1000}
+        
         if since:
             params['execution_date.gte'] = since
         
-        return self.get_splits(ticker=ticker, **params)
+        try:
+            results = self.client._paginate(endpoint, params)
+            logger.debug(f"Fetched {len(results)} splits for {ticker}")
+            return results
+        except Exception as e:
+            logger.error(f"Error fetching splits for {ticker}: {e}")
+            return []
+

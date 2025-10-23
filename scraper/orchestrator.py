@@ -8,8 +8,8 @@ CPU scaling, and S3 integration, refer to the original file.
 """
 import logging
 import time
-from datetime import datetime, timedelta
-from typing import List, Dict, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional
 from tqdm import tqdm
 
 from scraper.clients import (
@@ -17,8 +17,16 @@ from scraper.clients import (
     AggregatesClient,
     CorporateActionsClient,
     ReferenceClient,
-    NewsClient
+    NewsClient,
 )
+from scraper.clients.snapshot_client import SnapshotClient
+from scraper.pipeline import InMemoryMessageBus, RedisMessageBus
+from scraper.pipeline.kafka_integration import KafkaProducer
+from scraper.pipeline.snapshot_ingestor import SnapshotIngestor
+from scraper.registry.manager import RegistryManager
+from scraper.registry.models import IngestionStrategy, IngestionStatus
+from scraper.service.models import BackfillSource
+from common.config.settings import RedisConfig
 from common.storage.timescale_writer import TimescaleWriter
 
 logger = logging.getLogger(__name__)
@@ -39,11 +47,27 @@ class BackfillOrchestrator:
     continuous aggregates, and 10-20x compression.
     """
     
-    def __init__(self, polygon_api_key: str, db_writer: TimescaleWriter,
-                 years_back: int = 5, max_workers: int = 4, use_flatfiles: bool = False,
-                 debug: bool = False, skip_reference: bool = False, skip_corporate: bool = False,
-                 skip_daily: bool = False, skip_minute: bool = False, skip_news: bool = False,
-                 enable_hybrid_backfill: bool = False):
+    def __init__(
+        self,
+        polygon_api_key: str,
+        db_writer: TimescaleWriter,
+        years_back: int = 5,
+        max_workers: int = 4,
+        use_flatfiles: bool = False,
+        debug: bool = False,
+        skip_reference: bool = False,
+        skip_corporate: bool = False,
+        skip_daily: bool = False,
+        skip_minute: bool = False,
+        skip_news: bool = False,
+        enable_hybrid_backfill: bool = False,
+        source: BackfillSource = BackfillSource.REST,
+        publish_kafka: bool = False,
+        publish_redis: bool = True,
+        kafka_topic: str = "chronox.market.snapshots",
+        kafka_bootstrap: Optional[str] = None,
+        redis_config: Optional[RedisConfig] = None,
+    ):
         """
         Initialize backfill orchestrator.
         
@@ -60,6 +84,12 @@ class BackfillOrchestrator:
             skip_minute: Skip Phase 4 (minute bars / flat files)
             skip_news: Skip Phase 5 (news)
             enable_hybrid_backfill: Enable hybrid mode (flat files + REST API gap filling)
+            source: Preferred data source strategy (rest/flatfile/snapshot/hybrid)
+            publish_kafka: Enable Kafka publishing for snapshot payloads
+            publish_redis: Enable Redis publishing for snapshot payloads
+            kafka_topic: Kafka topic for published snapshots
+            kafka_bootstrap: Kafka bootstrap servers string
+            redis_config: Redis connection settings for publishing
         """
         # Initialize Polygon clients
         self.polygon_client = PolygonClient(polygon_api_key)
@@ -67,21 +97,64 @@ class BackfillOrchestrator:
         self.corp_client = CorporateActionsClient(self.polygon_client)
         self.ref_client = ReferenceClient(self.polygon_client)
         self.news_client = NewsClient(self.polygon_client)
+        self.snapshot_client = SnapshotClient(self.polygon_client)
         self.db_writer = db_writer
+        self.registry_manager = RegistryManager(db_writer)
         
         # Configuration
         self.years_back = years_back
         self.max_workers = max_workers
-        self.use_flatfiles = use_flatfiles
+        self.source = source
         self.debug = debug
-        self.enable_hybrid_backfill = enable_hybrid_backfill
+        self.enable_hybrid_backfill = enable_hybrid_backfill or source == BackfillSource.HYBRID
+        self.use_flatfiles = use_flatfiles or source in {BackfillSource.FLATFILE, BackfillSource.HYBRID}
+        snapshot_mode = source in (BackfillSource.SNAPSHOT, BackfillSource.HYBRID)
+        if publish_kafka and not snapshot_mode:
+            logger.debug("Kafka publishing requested but disabled for %s source", source.value)
+        if publish_redis and not snapshot_mode:
+            logger.debug("Redis publishing requested but disabled for %s source", source.value)
+        self.publish_kafka = publish_kafka and snapshot_mode
+        self.publish_redis = publish_redis and snapshot_mode
+        self.snapshot_enabled = snapshot_mode
+        self.kafka_topic = kafka_topic
+        self.kafka_bootstrap = kafka_bootstrap or "localhost:9092"
+        self.redis_config = redis_config
         
         # Skip flags for selective phase execution
         self.skip_reference = skip_reference
         self.skip_corporate = skip_corporate
         self.skip_daily = skip_daily
-        self.skip_minute = skip_minute
+        self.skip_minute = skip_minute or source == BackfillSource.SNAPSHOT
         self.skip_news = skip_news
+        
+        # Optional messaging integrations
+        self.kafka_producer: Optional[KafkaProducer] = None
+        if self.publish_kafka:
+            try:
+                self.kafka_producer = KafkaProducer(
+                    bootstrap_servers=self.kafka_bootstrap,
+                    topic=self.kafka_topic,
+                )
+            except Exception as exc:  # pragma: no cover - dependency availability
+                logger.error("Kafka producer disabled: %s", exc)
+                self.kafka_producer = None
+                self.publish_kafka = False
+        
+        self.message_bus = None
+        if self.publish_redis and self.snapshot_enabled:
+            self.message_bus = self._create_message_bus()
+        elif self.publish_redis and not self.snapshot_enabled:
+            logger.debug("Redis publishing disabled for non-snapshot sources")
+        
+        self.snapshot_ingestor: Optional[SnapshotIngestor] = None
+        if self.snapshot_enabled:
+            self.snapshot_ingestor = SnapshotIngestor(
+                snapshot_client=self.snapshot_client,
+                db_writer=db_writer,
+                kafka_producer=self.kafka_producer if self.publish_kafka else None,
+                kafka_topic=self.kafka_topic,
+                message_bus=self.message_bus if self.publish_redis else None,
+            )
         
         # Calculate date range
         self.end_date = datetime.now()
@@ -95,10 +168,55 @@ class BackfillOrchestrator:
             'process_queue': None
         }
         
-        logger.info(f"BackfillOrchestrator initialized: {self.start_date.date()} to {self.end_date.date()}")
-        logger.info(f"Database: TimescaleDB (PostgreSQL + TimescaleDB extension)")
+        logger.info(
+            "BackfillOrchestrator initialized (%s mode): %s to %s",
+            self.source.value,
+            self.start_date.date(),
+            self.end_date.date(),
+        )
+        logger.info("Database: TimescaleDB (PostgreSQL + TimescaleDB extension)")
+        if self.publish_kafka:
+            logger.info("Kafka publishing enabled -> %s", self.kafka_topic)
+        if self.publish_redis and self.message_bus:
+            logger.info("Redis publishing enabled")
+        if self.snapshot_enabled:
+            logger.info("Snapshot ingestion enabled")
         if debug:
-            logger.info(f"Debug mode: ENABLED")
+            logger.info("Debug mode: ENABLED")
+
+    def _create_message_bus(self):
+        redis_cfg = self.redis_config
+        try:
+            if redis_cfg:
+                return RedisMessageBus(
+                    host=redis_cfg.host,
+                    port=redis_cfg.port,
+                    db=redis_cfg.db,
+                    password=redis_cfg.password,
+                )
+            return RedisMessageBus()
+        except Exception as exc:  # pragma: no cover - optional dependency
+            logger.warning("Redis bus unavailable, using in-memory bus: %s", exc)
+            return InMemoryMessageBus()
+
+    def phase_snapshots(self, tickers: List[str]) -> int:
+        """Ingest full-market snapshots and distribute to configured sinks."""
+
+        if not self.snapshot_ingestor:
+            logger.debug("Snapshot ingestor not configured; skipping snapshot phase")
+            return 0
+
+        ingress_scope = "full market" if not tickers else f"{len(tickers)} tickers"
+        logger.info("=== SNAPSHOT INGESTION: %s ===", ingress_scope)
+
+        try:
+            target = tickers or None
+            count = self.snapshot_ingestor.ingest(tickers=target)
+            logger.info("Snapshot ingestion wrote %s records", count)
+            return count
+        except Exception as exc:
+            logger.error("Snapshot ingestion failed: %s", exc)
+            raise
     
     def phase1_reference_data(self, tickers: List[str]) -> Dict[str, bool]:
         """
@@ -357,6 +475,287 @@ class BackfillOrchestrator:
         logger.info(f"Phase 5 complete: {total_articles:,} articles written")
         return results
     
+    def execute_registry_strategies(self, symbols: Optional[List[str]] = None) -> Dict:
+        """
+        Execute ingestion strategies from symbol registry.
+        
+        This is the registry-driven orchestration method that replaces CLI arguments
+        with database-driven configuration. Each symbol has its own ingestion strategy
+        that determines how data is fetched and stored.
+        
+        Args:
+            symbols: Optional list of symbols to process. If None, processes all enabled symbols.
+        
+        Returns:
+            Summary dict with execution results per symbol
+        """
+        # Get symbols from registry
+        if symbols:
+            registry_entries = [self.registry_manager.get_symbol(s) for s in symbols]
+            registry_entries = [e for e in registry_entries if e is not None]
+        else:
+            registry_entries = self.registry_manager.list_symbols(enabled_only=True)
+        
+        if not registry_entries:
+            logger.warning("No enabled symbols found in registry")
+            return {}
+        
+        logger.info(f"=== EXECUTING REGISTRY STRATEGIES FOR {len(registry_entries)} SYMBOLS ===")
+        
+        results = {}
+        
+        for entry in registry_entries:
+            symbol = entry.symbol
+            strategy = entry.strategy
+            
+            logger.info(f"\n{'='*60}")
+            logger.info(f"Processing {symbol} with strategy: {strategy.value}")
+            logger.info(f"{'='*60}")
+            
+            try:
+                # Update status to running
+                self.registry_manager.update_status(symbol, IngestionStatus.RUNNING)
+                
+                symbol_result = {'strategy': strategy.value, 'phases': {}}
+                
+                # Execute strategy-specific phases
+                if strategy == IngestionStrategy.FLATPACK:
+                    symbol_result['phases'] = self._execute_flatpack(symbol)
+                
+                elif strategy == IngestionStrategy.SNAPSHOT:
+                    symbol_result['phases'] = self._execute_snapshot(symbol)
+                
+                elif strategy == IngestionStrategy.STREAM:
+                    symbol_result['phases'] = self._execute_stream(symbol)
+                
+                elif strategy == IngestionStrategy.FLATPACK_API:
+                    symbol_result['phases'] = self._execute_flatpack_api(symbol)
+                
+                elif strategy == IngestionStrategy.SNAPSHOT_STREAM:
+                    symbol_result['phases'] = self._execute_snapshot_stream(symbol)
+                
+                elif strategy == IngestionStrategy.FLATPACK_SNAPSHOT_STREAM:
+                    symbol_result['phases'] = self._execute_flatpack_snapshot_stream(symbol)
+                
+                else:
+                    logger.error(f"Unknown strategy: {strategy.value}")
+                    symbol_result['error'] = f"Unknown strategy: {strategy.value}"
+                
+                # Update status to idle on success
+                self.registry_manager.update_status(symbol, IngestionStatus.IDLE)
+                results[symbol] = symbol_result
+                
+            except Exception as e:
+                error_msg = f"Failed to execute strategy: {str(e)}"
+                logger.error(f"{symbol}: {error_msg}", exc_info=True)
+                self.registry_manager.update_status(symbol, IngestionStatus.ERROR, error_msg)
+                results[symbol] = {'strategy': strategy.value, 'error': error_msg}
+        
+        logger.info(f"\n{'='*60}")
+        logger.info(f"REGISTRY EXECUTION COMPLETE")
+        logger.info(f"{'='*60}\n")
+        
+        return results
+    
+    def _execute_flatpack(self, symbol: str) -> Dict:
+        """Execute FLATPACK strategy: S3 flat files only."""
+        logger.info(f"[FLATPACK] Starting flat file ingestion for {symbol}")
+        
+        results = {}
+        
+        # Phase 1: Reference data
+        results['reference'] = self.phase1_reference_data([symbol])
+        
+        # Phase 2: Corporate actions
+        results['corporate_actions'] = self.phase2_corporate_actions([symbol])
+        
+        # Phase 3: Daily bars
+        results['daily_bars'] = self.phase3_daily_bars([symbol])
+        
+        # Phase 4: Flat files (minute bars)
+        results['minute_bars'] = self.phase4_flatfiles([symbol])
+        
+        # Kafka publishing: Send completion event to symbol-specific topic
+        if self.kafka_producer:
+            topic = f"chronox.backfill.{symbol.lower()}"
+            self.kafka_producer.publish(
+                message={
+                    'symbol': symbol,
+                    'strategy': 'flatpack',
+                    'phase': 'completed',
+                    'timestamp': datetime.utcnow().isoformat(),
+                    'results': results,
+                },
+                topic=topic,
+                key=symbol,
+            )
+            logger.info(f"[FLATPACK] Published completion event to {topic}")
+        
+        # Update timestamp
+        self.registry_manager.update_timestamp(symbol, backfill=True)
+        
+        logger.info(f"[FLATPACK] Completed for {symbol}")
+        return results
+    
+    def _execute_snapshot(self, symbol: str) -> Dict:
+        """Execute SNAPSHOT strategy: Real-time snapshots only."""
+        logger.info(f"[SNAPSHOT] Starting snapshot ingestion for {symbol}")
+        
+        results = {}
+        
+        # Only snapshots
+        results['snapshots'] = self.phase_snapshots([symbol])
+        
+        # Kafka publishing: Snapshot data is already published by snapshot_ingestor
+        # Send completion event to symbol-specific topic
+        if self.kafka_producer:
+            topic = f"chronox.snapshot.{symbol.lower()}"
+            self.kafka_producer.publish(
+                message={
+                    'symbol': symbol,
+                    'strategy': 'snapshot',
+                    'phase': 'completed',
+                    'timestamp': datetime.utcnow().isoformat(),
+                    'count': results.get('snapshots', 0),
+                },
+                topic=topic,
+                key=symbol,
+            )
+            logger.info(f"[SNAPSHOT] Published completion event to {topic}")
+        
+        # Update timestamp
+        self.registry_manager.update_timestamp(symbol, snapshot=True)
+        
+        logger.info(f"[SNAPSHOT] Completed for {symbol}")
+        return results
+    
+    def _execute_stream(self, symbol: str) -> Dict:
+        """Execute STREAM strategy: WebSocket streaming only."""
+        logger.info(f"[STREAM] Starting stream for {symbol}")
+        
+        # This is a placeholder - actual streaming would be handled by a separate daemon
+        # For now, we'll just log that streaming should be enabled
+        logger.warning(f"[STREAM] Stream execution requires separate streaming daemon")
+        logger.warning(f"[STREAM] Add {symbol} to streaming watchlist")
+        
+        # Kafka publishing: Send stream activation event
+        if self.kafka_producer:
+            topic = f"chronox.stream.{symbol.lower()}"
+            self.kafka_producer.publish(
+                message={
+                    'symbol': symbol,
+                    'strategy': 'stream',
+                    'action': 'activate',
+                    'timestamp': datetime.utcnow().isoformat(),
+                },
+                topic=topic,
+                key=symbol,
+            )
+            logger.info(f"[STREAM] Published activation event to {topic}")
+        
+        # Update timestamp
+        self.registry_manager.update_timestamp(symbol, stream=True)
+        
+        return {'stream': 'enabled'}
+    
+    def _execute_flatpack_api(self, symbol: str) -> Dict:
+        """Execute FLATPACK_API strategy: Flat files + REST API for gaps."""
+        logger.info(f"[FLATPACK_API] Starting hybrid backfill for {symbol}")
+        
+        results = {}
+        
+        # Phase 1: Reference data
+        results['reference'] = self.phase1_reference_data([symbol])
+        
+        # Phase 2: Corporate actions
+        results['corporate_actions'] = self.phase2_corporate_actions([symbol])
+        
+        # Phase 3: Daily bars
+        results['daily_bars'] = self.phase3_daily_bars([symbol])
+        
+        # Phase 4: Flat files (minute bars)
+        results['minute_bars_flatfile'] = self.phase4_flatfiles([symbol])
+        
+        # Gap detection and REST API fill
+        # TODO: Implement gap detection logic
+        logger.info(f"[FLATPACK_API] Gap detection not yet implemented - using REST API")
+        results['minute_bars_api'] = self.phase4_minute_bars([symbol])
+        
+        # Update timestamp
+        self.registry_manager.update_timestamp(symbol, backfill=True)
+        
+        logger.info(f"[FLATPACK_API] Completed for {symbol}")
+        return results
+    
+    def _execute_snapshot_stream(self, symbol: str) -> Dict:
+        """Execute SNAPSHOT_STREAM strategy: Snapshots + streaming."""
+        logger.info(f"[SNAPSHOT_STREAM] Starting snapshot + stream for {symbol}")
+        
+        results = {}
+        
+        # Snapshots for historical context
+        results['snapshots'] = self.phase_snapshots([symbol])
+        
+        # Stream for real-time updates
+        logger.warning(f"[SNAPSHOT_STREAM] Stream execution requires separate streaming daemon")
+        logger.warning(f"[SNAPSHOT_STREAM] Add {symbol} to streaming watchlist")
+        results['stream'] = 'enabled'
+        
+        # Update timestamps
+        self.registry_manager.update_timestamp(symbol, snapshot=True, stream=True)
+        
+        logger.info(f"[SNAPSHOT_STREAM] Completed for {symbol}")
+        return results
+    
+    def _execute_flatpack_snapshot_stream(self, symbol: str) -> Dict:
+        """Execute FLATPACK_SNAPSHOT_STREAM strategy: Complete hybrid approach."""
+        logger.info(f"[FLATPACK_SNAPSHOT_STREAM] Starting full hybrid for {symbol}")
+        
+        results = {}
+        
+        # Phase 1: Reference data
+        results['reference'] = self.phase1_reference_data([symbol])
+        
+        # Phase 2: Corporate actions
+        results['corporate_actions'] = self.phase2_corporate_actions([symbol])
+        
+        # Phase 3: Daily bars
+        results['daily_bars'] = self.phase3_daily_bars([symbol])
+        
+        # Phase 4: Flat files (minute bars)
+        results['minute_bars'] = self.phase4_flatfiles([symbol])
+        
+        # Snapshots for recent data
+        results['snapshots'] = self.phase_snapshots([symbol])
+        
+        # Stream for real-time updates
+        logger.warning(f"[FLATPACK_SNAPSHOT_STREAM] Stream execution requires separate streaming daemon")
+        logger.warning(f"[FLATPACK_SNAPSHOT_STREAM] Add {symbol} to streaming watchlist")
+        results['stream'] = 'enabled'
+        
+        # Kafka publishing: Send completion event to all relevant topics
+        if self.kafka_producer:
+            for phase in ['backfill', 'snapshot', 'stream']:
+                topic = f"chronox.{phase}.{symbol.lower()}"
+                self.kafka_producer.publish(
+                    message={
+                        'symbol': symbol,
+                        'strategy': 'flatpack_snapshot_stream',
+                        'phase': phase,
+                        'status': 'completed',
+                        'timestamp': datetime.utcnow().isoformat(),
+                    },
+                    topic=topic,
+                    key=symbol,
+                )
+                logger.info(f"[FLATPACK_SNAPSHOT_STREAM] Published to {topic}")
+        
+        # Update all timestamps
+        self.registry_manager.update_timestamp(symbol, backfill=True, snapshot=True, stream=True)
+        
+        logger.info(f"[FLATPACK_SNAPSHOT_STREAM] Completed for {symbol}")
+        return results
+    
     def run_full_backfill(self, tickers: List[str]) -> Dict:
         """
         Run complete backfill process for specified tickers.
@@ -393,6 +792,11 @@ class BackfillOrchestrator:
         summary = {}
         
         try:
+            if self.source in (BackfillSource.SNAPSHOT, BackfillSource.HYBRID):
+                summary['snapshots'] = self.phase_snapshots(tickers)
+            else:
+                summary['snapshots'] = 0
+            
             # Phase 1: Reference Data
             if not self.skip_reference:
                 summary['reference'] = self.phase1_reference_data(tickers)
@@ -452,5 +856,10 @@ class BackfillOrchestrator:
     
     def close(self):
         """Clean up resources"""
+        if self.kafka_producer:
+            try:
+                self.kafka_producer.close()
+            except Exception:  # pragma: no cover - defensive cleanup
+                logger.debug("Kafka producer close failed", exc_info=True)
         self.polygon_client.close()
         self.db_writer.close()

@@ -68,7 +68,9 @@ class RedisMessageBus(MessageBus):
             port=port, 
             db=db, 
             password=password,
-            decode_responses=True
+            decode_responses=True,
+            socket_connect_timeout=2,
+            socket_timeout=2,
         )
         self.pubsub = None
         
